@@ -1,0 +1,1529 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Restaurant ordering server — zero dependency (Python 3 standard library only).
+
+Run:      python3 server.py
+Tablets:  http://<server-ip>:8080   (waiter / kitchen / admin, same page)
+
+Features
+  - Menu with sections (add / edit / reorder / activate)
+  - Waiters with assigned table numbers (managed by admin)
+  - Orders sent straight to the kitchen screen, status workflow
+  - Cancel whole orders or single lines (with reason)
+  - Ticket printing: ESC/POS thermal printer on the LAN (port 9100)
+    and/or browser print view from any tablet
+  - All data stored locally in SQLite (data/restaurant.db)
+"""
+import hashlib
+import json
+import base64
+import datetime
+import math
+import os
+import re
+import socket
+import sqlite3
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("RT_DATA") or os.path.join(BASE, "data")
+DB_PATH = os.path.join(DATA_DIR, "restaurant.db")
+CONFIG_PATH = os.environ.get("RT_CONFIG") or os.path.join(BASE, "config.json")
+TICKETS_DIR = os.path.join(DATA_DIR, "tickets")
+AUDIT_DIR = os.path.join(DATA_DIR, "logs")
+IMAGES_DIR = os.path.join(DATA_DIR, "item_images")
+APP_PATH = os.path.join(BASE, "app.html")
+
+DEFAULT_CONFIG = {
+    "restaurant_name": "My Restaurant",
+    "currency": "MAD",
+    "admin_pin": "1234",
+    "printer_ip": "",          # e.g. "192.168.1.50" (ESC/POS, port 9100). Empty = off.
+    "printer_port": 9100,
+    "autoprint": True,         # print ticket automatically when an order arrives
+    "port": 8080,
+}
+
+# ---------------------------------------------------------------- config / db
+
+_lock = threading.Lock()
+_audit_lock = threading.Lock()
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+def save_config(cfg):
+    with _lock:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+CONFIG = load_config()
+
+def db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS sections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    position INTEGER DEFAULT 0,
+    active INTEGER DEFAULT 1,
+    branch_id INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    section_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    price REAL NOT NULL DEFAULT 0,
+    description TEXT DEFAULT '',
+    position INTEGER DEFAULT 0,
+    active INTEGER DEFAULT 1,
+    branch_id INTEGER NOT NULL DEFAULT 1,
+    stock_qty INTEGER,
+    image_url TEXT DEFAULT '',
+    modifiers TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS staff (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    tables TEXT DEFAULT '[]',
+    active INTEGER DEFAULT 1,
+    branch_id INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uuid TEXT UNIQUE,
+    table_no INTEGER NOT NULL,
+    staff_id INTEGER,
+    staff_name TEXT DEFAULT '',
+    note TEXT DEFAULT '',
+    status TEXT DEFAULT 'sent',
+    cancel_reason TEXT DEFAULT '',
+    created_at REAL,
+    updated_at REAL,
+    branch_id INTEGER NOT NULL DEFAULT 1,
+    bill_requested INTEGER NOT NULL DEFAULT 0,
+    lang TEXT NOT NULL DEFAULT 'fr'
+);
+CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    item_id INTEGER,
+    name TEXT NOT NULL,
+    price REAL NOT NULL,
+    qty INTEGER NOT NULL DEFAULT 1,
+    note TEXT DEFAULT '',
+    status TEXT DEFAULT 'sent',
+    modifiers TEXT NOT NULL DEFAULT '[]',
+    stock_debited INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS branches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_id INTEGER NOT NULL DEFAULT 1,
+    guest_name TEXT NOT NULL,
+    contact TEXT DEFAULT '',
+    starts_at REAL NOT NULL,
+    party_size INTEGER NOT NULL,
+    table_no INTEGER,
+    status TEXT NOT NULL DEFAULT 'booked',
+    note TEXT DEFAULT '',
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    amount REAL NOT NULL,
+    refunded_amount REAL NOT NULL DEFAULT 0,
+    method TEXT NOT NULL,
+    note TEXT DEFAULT '',
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS payment_allocations (
+    payment_id INTEGER NOT NULL,
+    order_item_id INTEGER NOT NULL,
+    qty REAL NOT NULL,
+    PRIMARY KEY (payment_id, order_item_id)
+);
+"""
+
+def init_db():
+    conn = db()
+    conn.executescript(SCHEMA)
+    conn.execute("INSERT OR IGNORE INTO branches(id, name) VALUES(1, 'Main Branch')")
+    migrations = {
+        "sections": {
+            "branch_id": "INTEGER NOT NULL DEFAULT 1",
+            "kitchen_station": "TEXT DEFAULT ''",
+        },
+        "items": {"branch_id": "INTEGER NOT NULL DEFAULT 1", "stock_qty": "INTEGER",
+                  "image_url": "TEXT DEFAULT ''", "modifiers": "TEXT NOT NULL DEFAULT '[]'"},
+        "staff": {
+            "branch_id": "INTEGER NOT NULL DEFAULT 1",
+            "pin": "TEXT DEFAULT ''",
+            "role": "TEXT DEFAULT 'waiter'",
+            "kitchen_station": "TEXT DEFAULT ''",
+        },
+        "orders": {"branch_id": "INTEGER NOT NULL DEFAULT 1",
+                   "bill_requested": "INTEGER NOT NULL DEFAULT 0",
+                   "lang": "TEXT NOT NULL DEFAULT 'fr'"},
+        "order_items": {"modifiers": "TEXT NOT NULL DEFAULT '[]'",
+                        "stock_debited": "INTEGER NOT NULL DEFAULT 0"},
+        "payments": {"refunded_amount": "REAL NOT NULL DEFAULT 0"},
+    }
+    for table, columns in migrations.items():
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(%s)" % table)}
+        for column, definition in columns.items():
+            if column not in existing:
+                conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, definition))
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_branch_created ON orders(branch_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reservations_branch_time ON reservations(branch_id, starts_at)")
+    row = conn.execute("SELECT value FROM meta WHERE key='rev'").fetchone()
+    if row is None:
+        conn.execute("INSERT INTO meta(key, value) VALUES('rev','1')")
+        seed(conn)
+    conn.commit()
+    conn.close()
+
+def seed(conn):
+    """First run: a small demo menu so the app is usable immediately."""
+    secs = [("Starters", 1), ("Main Courses", 2), ("Desserts", 3), ("Drinks", 4)]
+    for name, pos in secs:
+        conn.execute("INSERT INTO sections(name, position, active) VALUES(?,?,1)", (name, pos))
+    demo = {
+        "Starters": [("Garlic Bread", 4.5), ("Tomato Soup", 5.0), ("Chicken Wings", 8.0)],
+        "Main Courses": [("Margherita Pizza", 12.0), ("Beef Burger", 13.5),
+                         ("Grilled Salmon", 18.0), ("Pasta Carbonara", 14.0)],
+        "Desserts": [("Cheesecake", 6.0), ("Tiramisu", 6.5), ("Ice Cream", 4.0)],
+        "Drinks": [("Cola", 2.5), ("Sparkling Water", 2.0), ("Orange Juice", 3.5),
+                   ("Espresso", 2.0), ("House Red Wine", 5.0)],
+    }
+    for name, pos in secs:
+        for i, (item, price) in enumerate(demo[name], start=1):
+            conn.execute(
+                "INSERT INTO items(section_id, name, price, position, active) "
+                "VALUES((SELECT id FROM sections WHERE name=?), ?, ?, ?, 1)",
+                (name, item, price, i))
+    for name, tables in [("Alex", list(range(1, 9))), ("Maria", list(range(9, 17)))]:
+        conn.execute("INSERT INTO staff(name, tables, active) VALUES(?,?,1)",
+                     (name, json.dumps(tables)))
+
+def bump_rev(conn):
+    conn.execute("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key='rev'")
+
+def get_rev(conn):
+    return int(conn.execute("SELECT value FROM meta WHERE key='rev'").fetchone()["value"])
+
+# ---------------------------------------------------------------- helpers
+
+class ApiError(Exception):
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
+        self.msg = msg
+
+def parse_tables(raw):
+    """Accept [1,2,3] or JSON string list; return sorted unique ints."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = []
+    out = set()
+    for t in raw or []:
+        try:
+            out.add(int(t))
+        except Exception:
+            pass
+    return sorted(out)
+
+def order_total(lines):
+    return round(sum(l["price"] * l["qty"] for l in lines if l["status"] != "cancelled"), 2)
+
+def get_order(conn, order_id, with_lines=True):
+    o = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    if not o:
+        raise ApiError(404, "Order not found")
+    o = dict(o)
+    if with_lines:
+        o["lines"] = [dict(r) for r in conn.execute(
+            "SELECT * FROM order_items WHERE order_id=? ORDER BY id", (order_id,))]
+        o["total"] = order_total(o["lines"])
+    return o
+
+def recompute_order_status(conn, order_id):
+    """Derive order status from its lines (cancel / all-ready cases)."""
+    lines = [dict(r) for r in conn.execute(
+        "SELECT status FROM order_items WHERE order_id=?", (order_id,))]
+    o = dict(conn.execute("SELECT status FROM orders WHERE id=?", (order_id,)).fetchone())
+    if o["status"] in ("served", "cancelled"):
+        return
+    active = [l for l in lines if l["status"] != "cancelled"]
+    if not active:
+        new = "cancelled"
+    elif all(l["status"] == "ready" for l in active):
+        new = "ready"
+    elif any(l["status"] in ("preparing", "ready") for l in active):
+        new = "preparing"
+    else:
+        new = "sent"
+    if new != o["status"]:
+        conn.execute("UPDATE orders SET status=?, updated_at=? WHERE id=?",
+                     (new, time.time(), order_id))
+
+def check_admin(headers):
+    pin = headers.get("X-Admin-Pin", "")
+    if str(pin) != str(CONFIG.get("admin_pin", "")):
+        raise ApiError(403, "Wrong or missing admin PIN (X-Admin-Pin header)")
+
+def get_branch_id(body):
+    try:
+        branch_id = int(body.get("branch_id") or 1)
+    except (TypeError, ValueError):
+        raise ApiError(400, "Invalid branch")
+    if branch_id <= 0:
+        raise ApiError(400, "Invalid branch")
+    return branch_id
+
+def require_branch(conn, branch_id):
+    if not conn.execute("SELECT 1 FROM branches WHERE id=? AND active=1",
+                        (branch_id,)).fetchone():
+        raise ApiError(404, "Branch not found")
+
+def restore_stock(conn, order_id, line_id=None):
+    sql = ("SELECT oi.id, oi.item_id, oi.qty, oi.stock_debited FROM order_items oi "
+           "WHERE oi.order_id=? AND oi.stock_debited=1")
+    params = [order_id]
+    if line_id is not None:
+        sql += " AND oi.id=?"
+        params.append(line_id)
+    for row in conn.execute(sql, params).fetchall():
+        conn.execute("UPDATE items SET stock_qty=stock_qty+? WHERE id=? AND stock_qty IS NOT NULL",
+                     (row["qty"], row["item_id"]))
+        conn.execute("UPDATE order_items SET stock_debited=0 WHERE id=?", (row["id"],))
+
+def parse_modifiers(raw):
+    if not isinstance(raw, list) or len(raw) > 30:
+        raise ApiError(400, "Modifiers must be a list of at most 30 options")
+    out, seen = [], set()
+    for modifier in raw:
+        if not isinstance(modifier, dict):
+            raise ApiError(400, "Invalid modifier")
+        name = str(modifier.get("name") or "").strip()[:80]
+        try:
+            price = round(float(modifier.get("price", 0)), 2)
+        except (TypeError, ValueError):
+            raise ApiError(400, "Invalid modifier price")
+        if not name or not math.isfinite(price) or price < 0 or name in seen:
+            raise ApiError(400, "Modifier names must be unique and prices non-negative")
+        seen.add(name)
+        out.append({"name": name, "price": price})
+    return out
+
+# ---------------------------------------------------------------- ticket / printing
+
+TICKET_W = 42
+
+def ticket_text(order, lang="fr"):
+    """Plain-text ticket for 80mm (42 col) thermal printers."""
+    cfg = CONFIG
+    labels = {
+        "fr": {
+            "ticket": "Ticket", "table": "Table", "waiter": "Serveur",
+            "cancelled": "ANNULÉ", "ready": "PRÊT", "total": "TOTAL",
+            "order_cancelled": "COMMANDE ANNULÉE", "reason": "Motif",
+        },
+        "ar": {
+            "ticket": "تذكرة", "table": "طاولة", "waiter": "النادل",
+            "cancelled": "ملغى", "ready": "جاهز", "total": "المجموع",
+            "order_cancelled": "تم إلغاء الطلب", "reason": "السبب",
+        },
+        "en": {
+            "ticket": "Ticket", "table": "Table", "waiter": "Waiter",
+            "cancelled": "CANCELLED", "ready": "READY", "total": "TOTAL",
+            "order_cancelled": "ORDER CANCELLED", "reason": "Reason",
+        },
+    }
+    labels = labels.get(lang, labels["en"])
+    sep = "-" * TICKET_W
+    created = time.strftime("%d/%m/%Y %H:%M", time.localtime(order["created_at"]))
+    out = []
+    out.append(cfg["restaurant_name"][:TICKET_W].center(TICKET_W).rstrip())
+    out.append(sep)
+    out.append("%s #%d" % (labels["ticket"], order["id"]))
+    out.append("%s: %s" % (labels["table"], order["table_no"]))
+    out.append("%s: %s" % (labels["waiter"], order["staff_name"] or "-"))
+    out.append(created)
+    if order.get("note"):
+        out.append("** %s **" % order["note"])
+    out.append(sep)
+    for l in order["lines"]:
+        if l["status"] == "cancelled":
+            out.append("%dx %-24s %s" % (l["qty"], l["name"][:24], labels["cancelled"]))
+            continue
+        line = "%dx %s" % (l["qty"], l["name"][:TICKET_W - 12])
+        amt = "%0.2f %s" % (l["price"] * l["qty"], cfg.get("currency") or "MAD")
+        out.append(line.ljust(TICKET_W - len(amt)) + amt)
+        try:
+            modifiers = json.loads(l.get("modifiers") or "[]")
+        except (TypeError, ValueError):
+            modifiers = []
+        if modifiers:
+            out.append("   + " + ", ".join(m["name"] for m in modifiers))
+        if l["note"]:
+            for sub in [l["note"][i:i + TICKET_W - 4] for i in range(0, len(l["note"]), TICKET_W - 4)]:
+                out.append("   . " + sub)
+        if l["status"] == "ready":
+            out.append("   . " + labels["ready"])
+    out.append(sep)
+    tot = "%0.2f %s" % (order["total"], cfg.get("currency") or "MAD")
+    out.append(labels["total"].ljust(TICKET_W - len(tot)) + tot)
+    out.append(sep)
+    if order["status"] == "cancelled":
+        out.append("*** %s ***" % labels["order_cancelled"].center(TICKET_W - 8))
+        if order.get("cancel_reason"):
+            out.append(labels["reason"] + ": " + order["cancel_reason"])
+    return "\n".join(out)
+
+def escpos_bytes(text):
+    b = b"\x1b@"                      # init
+    b += b"\x1ba\x01"                 # center
+    header, rest = text.split("\n", 1)
+    b += header.encode("cp437", errors="replace") + b"\n"
+    b += b"\x1ba\x00"                 # left
+    b += rest.encode("cp437", errors="replace") + b"\n\n\n"
+    b += b"\x1dV\x01"                 # full cut
+    return b
+
+def send_escpos(text):
+    """Send raw ESC/POS to a network thermal printer. Returns (ok, error)."""
+    ip = (CONFIG.get("printer_ip") or "").strip()
+    if not ip:
+        return False, "No printer configured"
+    port = int(CONFIG.get("printer_port") or 9100)
+    try:
+        s = socket.create_connection((ip, port), timeout=4)
+        try:
+            s.sendall(escpos_bytes(text))
+        finally:
+            s.close()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+def save_ticket(order, text):
+    try:
+        os.makedirs(TICKETS_DIR, exist_ok=True)
+        path = os.path.join(TICKETS_DIR, "ticket_%d_%s.txt" % (order["id"],
+                        time.strftime("%Y%m%d_%H%M%S")))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+    except Exception:
+        return ""
+
+def print_ticket(order_id):
+    conn = db()
+    try:
+        order = get_order(conn, order_id)
+    finally:
+        conn.close()
+    text = ticket_text(order, order.get("lang", "fr"))
+    save_ticket(order, text)
+    ok, err = send_escpos(text)
+    return {"ok": True, "printed": ok, "error": err, "ticket": text}
+
+def maybe_autoprint(order_id):
+    if CONFIG.get("autoprint") and (CONFIG.get("printer_ip") or "").strip():
+        threading.Thread(target=lambda: (lambda r: print("autoprint #%d: %s" %
+            (order_id, "ok" if r["printed"] else r["error"])))(print_ticket(order_id)),
+            daemon=True).start()
+
+TICKET_HTML = """<!doctype html><html lang="%(lang)s" dir="%(dir)s"><head><meta charset="utf-8">
+<title>%(ticket)s #%(id)d</title><style>
+@page { size: 80mm auto; margin: 3mm; }
+body { font: 12px/1.35 "Courier New", monospace; white-space: pre; margin: 0; direction: %(dir)s; text-align: %(align)s; }
+@media print { .noprint { display: none } }
+.noprint { padding: 8px; text-align: center; }
+.noprint button { font-size: 16px; padding: 10px 22px; }
+</style></head><body>
+<div class="noprint"><button onclick="window.print()">%(print_label)s #%(id)d</button></div>
+%(body)s
+</body></html>"""
+
+def ticket_html(order_id, lang="en"):
+    if lang not in ("fr", "ar", "en"):
+        lang = "en"
+    conn = db()
+    try:
+        order = get_order(conn, order_id)
+    finally:
+        conn.close()
+    text = ticket_text(order, lang).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    labels = {"fr": ("Imprimer le ticket", "right"), "ar": ("طباعة التذكرة", "right"),
+              "en": ("Print ticket", "left")}
+    print_label, align = labels[lang]
+    return TICKET_HTML % {
+        "id": order_id, "body": "<div>%s</div>" % text, "lang": lang,
+        "dir": "rtl" if lang == "ar" else "ltr", "align": align,
+        "ticket": {"fr": "Ticket", "ar": "تذكرة", "en": "Ticket"}[lang],
+        "print_label": print_label,
+    }
+
+# ---------------------------------------------------------------- API handlers
+
+def h_ticket(args, body, conn):
+    order_id = int(args[0])
+    order = get_order(conn, order_id, with_lines=False)
+    if order["branch_id"] != get_branch_id(body):
+        raise ApiError(404, "Order not found")
+    return ticket_html(order_id, body.get("lang", "fr"))
+
+def h_state(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    cutoff = time.time() - 86400
+
+    # Build a quick lookup: item_id -> kitchen_station (via sections join)
+    station_by_item = {}
+    for row in conn.execute(
+            "SELECT i.id item_id, s.kitchen_station FROM items i "
+            "JOIN sections s ON s.id=i.section_id WHERE i.branch_id=?", (branch_id,)):
+        station_by_item[row["item_id"]] = row["kitchen_station"] or ""
+
+    orders = [dict(r) for r in conn.execute(
+        "SELECT * FROM orders WHERE branch_id=? AND "
+        "(status IN ('sent','preparing','ready') OR created_at > ?) "
+        "ORDER BY created_at DESC LIMIT 300", (branch_id, cutoff))]
+    for o in orders:
+        o["lines"] = [dict(r) for r in conn.execute(
+            "SELECT * FROM order_items WHERE order_id=? ORDER BY id", (o["id"],))]
+        for line in o["lines"]:
+            line["kitchen_station"] = station_by_item.get(line.get("item_id"), "")
+            line["paid_qty"] = conn.execute(
+                "SELECT COALESCE(SUM(pa.qty * (p.amount-p.refunded_amount)/p.amount),0) q "
+                "FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id "
+                "WHERE p.order_id=? AND pa.order_item_id=? AND p.amount>0",
+                (o["id"], line["id"])).fetchone()["q"]
+        o["total"] = order_total(o["lines"])
+        o["paid"] = round(sum(payment["amount"] for payment in conn.execute(
+            "SELECT amount-refunded_amount amount FROM payments WHERE order_id=?", (o["id"],))), 2)
+        o["balance"] = round(o["total"] - o["paid"], 2)
+        o["payments"] = [dict(payment) for payment in conn.execute(
+            "SELECT * FROM payments WHERE order_id=? ORDER BY created_at", (o["id"],))]
+        # Compute kitchen_stations: distinct non-empty stations from active (non-cancelled) lines
+        stations_seen = set()
+        for line in o["lines"]:
+            if line["status"] != "cancelled" and line.get("item_id") is not None:
+                ks = station_by_item.get(line["item_id"], "")
+                if ks:
+                    stations_seen.add(ks)
+        o["kitchen_stations"] = sorted(stations_seen)
+
+    # Build staff list: include has_pin, role, kitchen_station; never include pin hash
+    raw_staff = [dict(r) for r in conn.execute(
+        "SELECT * FROM staff WHERE branch_id=? ORDER BY id", (branch_id,))]
+    staff_out = []
+    for s in raw_staff:
+        s["has_pin"] = bool(s.get("pin", ""))
+        s.pop("pin", None)
+        s.setdefault("role", "waiter")
+        s.setdefault("kitchen_station", "")
+        staff_out.append(s)
+
+    return {
+        "branch_id": branch_id,
+        "rev": get_rev(conn),
+        "now": time.time(),
+        "restaurant": CONFIG["restaurant_name"],
+        "currency": CONFIG["currency"],
+        "has_printer": bool((CONFIG.get("printer_ip") or "").strip()),
+        "settings": {k: CONFIG.get(k) for k in
+                     ("restaurant_name", "currency", "printer_ip", "printer_port", "autoprint")},
+        "branches": [dict(r) for r in conn.execute(
+            "SELECT * FROM branches WHERE active=1 ORDER BY id")],
+        "sections": [dict(r) for r in conn.execute(
+            "SELECT * FROM sections WHERE branch_id=? ORDER BY position, id", (branch_id,))],
+        "items": [dict(r) for r in conn.execute(
+            "SELECT * FROM items WHERE branch_id=? ORDER BY position, id", (branch_id,))],
+        "staff": staff_out,
+        "reservations": [dict(r) for r in conn.execute(
+            "SELECT * FROM reservations WHERE branch_id=? AND starts_at>=? "
+            "ORDER BY starts_at LIMIT 300", (branch_id, cutoff))],
+        "payments": [dict(payment) for order in orders for payment in conn.execute(
+            "SELECT * FROM payments WHERE order_id=? ORDER BY created_at", (order["id"],))],
+        "orders": orders,
+    }
+
+def h_staff_auth(args, body, conn):
+    """POST /api/staff/auth — no admin required."""
+    staff_id = body.get("staff_id")
+    pin_input = str(body.get("pin") or "")
+    if not staff_id:
+        raise ApiError(400, "staff_id required")
+    row = conn.execute("SELECT * FROM staff WHERE id=? AND active=1", (staff_id,)).fetchone()
+    if not row:
+        raise ApiError(403, "Forbidden")
+    stored_pin = row["pin"] if "pin" in row.keys() else ""
+    if not stored_pin:
+        raise ApiError(403, "Ask the administrator to set your password")
+    hashed_input = hashlib.sha256(pin_input.encode()).hexdigest()
+    if hashed_input != stored_pin:
+        raise ApiError(403, "Wrong PIN")
+    return {
+        "ok": True,
+        "staff_id": row["id"],
+        "name": row["name"],
+        "role": row["role"] if "role" in row.keys() else "waiter",
+        "kitchen_station": row["kitchen_station"] if "kitchen_station" in row.keys() else "",
+    }
+
+def h_order_create(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    table_no = body.get("table_no")
+    if isinstance(table_no, bool) or not isinstance(table_no, int) or table_no <= 0:
+        raise ApiError(400, "table_no must be a positive integer")
+    lines = body.get("lines") or []
+    if not lines:
+        raise ApiError(400, "Order has no items")
+    # idempotency: same client_uuid returns the already-created order
+    uuid = str(body.get("client_uuid") or "")
+    if uuid:
+        existing = conn.execute("SELECT id,branch_id FROM orders WHERE uuid=?", (uuid,)).fetchone()
+        if existing:
+            if existing["branch_id"] != branch_id:
+                raise ApiError(409, "Client order ID is already used by another branch")
+            return {"ok": True, "order_id": existing["id"], "duplicate": True}
+    staff_id = body.get("staff_id")
+    staff_name = ""
+    if staff_id:
+        s = conn.execute("SELECT name FROM staff WHERE id=? AND branch_id=?",
+                         (staff_id, branch_id)).fetchone()
+        if not s:
+            raise ApiError(400, "Waiter does not belong to this branch")
+        staff_name = s["name"]
+    now = time.time()
+    cur = conn.execute(
+        "INSERT INTO orders(uuid, table_no, staff_id, staff_name, note, status, created_at, updated_at, branch_id, lang) "
+        "VALUES(?,?,?,?,?,'sent',?,?,?,?)",
+        (uuid or None, table_no, staff_id, staff_name, str(body.get("note") or "")[:300], now, now,
+         branch_id, body.get("lang") if body.get("lang") in ("fr", "ar", "en") else "fr"))
+    order_id = cur.lastrowid
+    for l in lines:
+        try:
+            raw_qty = float(l.get("qty", 1))
+            if not math.isfinite(raw_qty) or not raw_qty.is_integer():
+                raise ValueError()
+            qty = int(raw_qty)
+        except (TypeError, ValueError):
+            conn.rollback()
+            raise ApiError(400, "Invalid item quantity")
+        if qty < 1 or qty > 50:
+            conn.rollback()
+            raise ApiError(400, "Item quantity must be between 1 and 50")
+        it = conn.execute("SELECT * FROM items WHERE id=? AND branch_id=? AND active=1",
+                          (l.get("item_id"), branch_id)).fetchone()
+        if not it:
+            continue
+        if it["stock_qty"] is not None and it["stock_qty"] < qty:
+            conn.rollback()
+            raise ApiError(409, "%s is out of stock" % it["name"])
+        allowed_modifiers = json.loads(it["modifiers"] or "[]")
+        selected = l.get("modifiers") or []
+        if not isinstance(selected, list):
+            conn.rollback()
+            raise ApiError(400, "Invalid selected modifiers")
+        selected_names = {str(m.get("name") or "") for m in selected if isinstance(m, dict)}
+        actual_modifiers = [m for m in allowed_modifiers if m["name"] in selected_names]
+        if len(actual_modifiers) != len(selected_names):
+            conn.rollback()
+            raise ApiError(400, "Unknown item modifier")
+        unit_price = round(it["price"] + sum(m["price"] for m in actual_modifiers), 2)
+        stock_debited = int(it["stock_qty"] is not None)
+        if stock_debited:
+            conn.execute("UPDATE items SET stock_qty=stock_qty-? WHERE id=? AND branch_id=?",
+                         (qty, it["id"], branch_id))
+        conn.execute(
+            "INSERT INTO order_items(order_id, item_id, name, price, qty, note, status, modifiers, stock_debited) "
+            "VALUES(?,?,?,?,?,?, 'sent',?,?)",
+            (order_id, it["id"], it["name"], unit_price, qty, str(l.get("note") or "")[:200],
+             json.dumps(actual_modifiers, ensure_ascii=False), stock_debited))
+    n = conn.execute("SELECT COUNT(*) c FROM order_items WHERE order_id=?", (order_id,)).fetchone()["c"]
+    if n == 0:
+        conn.execute("DELETE FROM orders WHERE id=?", (order_id,))
+        raise ApiError(400, "No valid items in order")
+    bump_rev(conn)
+    conn.commit()
+    maybe_autoprint(order_id)
+    return {"ok": True, "order_id": order_id}
+
+def h_order_status(args, body, conn):
+    branch_id = get_branch_id(body)
+    order_id = int(args[0])
+    status = body.get("status")
+    if status not in ("preparing", "ready", "served", "cancelled"):
+        raise ApiError(400, "Bad status")
+    order = get_order(conn, order_id, with_lines=False)
+    if order["branch_id"] != branch_id:
+        raise ApiError(404, "Order not found")
+    if order["status"] == "served" and status != "served":
+        raise ApiError(400, "Order already served")
+    if status == "cancelled" and conn.execute(
+            "SELECT 1 FROM payments WHERE order_id=? AND amount>refunded_amount LIMIT 1",
+            (order_id,)).fetchone():
+        raise ApiError(409, "Refund recorded payments before cancelling this order")
+    conn.execute("UPDATE orders SET status=?, updated_at=? WHERE id=?",
+                 (status, time.time(), order_id))
+    if status == "cancelled":
+        conn.execute("UPDATE orders SET cancel_reason=? WHERE id=?",
+                     (str(body.get("reason") or "")[:300], order_id))
+        conn.execute("UPDATE order_items SET status='cancelled' WHERE order_id=? AND status!='served'",
+                     (order_id,))
+        restore_stock(conn, order_id)
+    elif status == "preparing":
+        conn.execute("UPDATE order_items SET status='preparing' WHERE order_id=? AND status='sent'",
+                     (order_id,))
+    elif status == "ready":
+        conn.execute("UPDATE order_items SET status='ready' WHERE order_id=? AND status IN ('sent','preparing')",
+                     (order_id,))
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True}
+
+def h_line_status(args, body, conn):
+    branch_id = get_branch_id(body)
+    order_id, line_id = int(args[0]), int(args[1])
+    status = body.get("status")
+    if status not in ("sent", "preparing", "ready", "cancelled"):
+        raise ApiError(400, "Bad status")
+    li = conn.execute("SELECT * FROM order_items WHERE id=? AND order_id=?",
+                      (line_id, order_id)).fetchone()
+    if not li:
+        raise ApiError(404, "Line not found")
+    order = conn.execute("SELECT branch_id FROM orders WHERE id=?", (order_id,)).fetchone()
+    if not order or order["branch_id"] != branch_id:
+        raise ApiError(404, "Order not found")
+    if status == "cancelled" and conn.execute(
+            "SELECT 1 FROM payments WHERE order_id=? AND amount>refunded_amount LIMIT 1",
+            (order_id,)).fetchone():
+        raise ApiError(409, "Refund recorded payments before cancelling an item")
+    conn.execute("UPDATE order_items SET status=? WHERE id=?", (status, line_id))
+    if status == "cancelled":
+        restore_stock(conn, order_id, line_id)
+        conn.execute("UPDATE orders SET cancel_reason=CASE WHEN cancel_reason='' "
+                     "THEN ? ELSE cancel_reason END WHERE id=?",
+                     ("item cancelled: " + li["name"], order_id))
+    recompute_order_status(conn, order_id)
+    conn.execute("UPDATE orders SET updated_at=? WHERE id=?", (time.time(), order_id))
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True}
+
+def h_section_create(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    name = str(body.get("name") or "").strip()
+    if not name:
+        raise ApiError(400, "Name required")
+    kitchen_station = str(body.get("kitchen_station") or "").strip()[:100]
+    pos = conn.execute("SELECT COALESCE(MAX(position),0)+1 p FROM sections WHERE branch_id=?",
+                       (branch_id,)).fetchone()["p"]
+    conn.execute("INSERT INTO sections(name, position, active, branch_id, kitchen_station) VALUES(?,?,1,?,?)",
+                 (name, pos, branch_id, kitchen_station))
+    bump_rev(conn); conn.commit()
+    return {"ok": True}
+
+def h_section_update(args, body, conn):
+    branch_id = get_branch_id(body)
+    sid = int(args[0])
+    s = conn.execute("SELECT * FROM sections WHERE id=? AND branch_id=?",
+                      (sid, branch_id)).fetchone()
+    if not s:
+        raise ApiError(404, "Section not found")
+    if "name" in body:
+        name = str(body["name"]).strip()
+        if not name:
+            raise ApiError(400, "Name required")
+        conn.execute("UPDATE sections SET name=? WHERE id=? AND branch_id=?", (name, sid, branch_id))
+    if "kitchen_station" in body:
+        conn.execute("UPDATE sections SET kitchen_station=? WHERE id=? AND branch_id=?",
+                     (str(body["kitchen_station"] or "").strip()[:100], sid, branch_id))
+    for k in ("position", "active"):
+        if k in body:
+            conn.execute("UPDATE sections SET %s=? WHERE id=? AND branch_id=?" % k,
+                         (int(body[k]), sid, branch_id))
+    bump_rev(conn); conn.commit()
+    return {"ok": True}
+
+def h_section_delete(args, body, conn):
+    branch_id = get_branch_id(body)
+    sid = int(args[0])
+    if not conn.execute("SELECT 1 FROM sections WHERE id=? AND branch_id=?", (sid, branch_id)).fetchone():
+        raise ApiError(404, "Section not found")
+    n = conn.execute("SELECT COUNT(*) c FROM items WHERE section_id=? AND branch_id=?",
+                     (sid, branch_id)).fetchone()["c"]
+    if n:
+        raise ApiError(400, "Section still has %d item(s) — move or delete them first" % n)
+    conn.execute("DELETE FROM sections WHERE id=? AND branch_id=?", (sid, branch_id))
+    bump_rev(conn); conn.commit()
+    return {"ok": True}
+
+def h_item_create(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    name = str(body.get("name") or "").strip()
+    if not name:
+        raise ApiError(400, "Name required")
+    try:
+        price = round(float(body.get("price")), 2)
+        if not math.isfinite(price) or price < 0:
+            raise ValueError()
+    except Exception:
+        raise ApiError(400, "Bad price")
+    sid = body.get("section_id")
+    if not conn.execute("SELECT 1 FROM sections WHERE id=? AND branch_id=?", (sid, branch_id)).fetchone():
+        raise ApiError(400, "Bad section")
+    pos = conn.execute("SELECT COALESCE(MAX(position),0)+1 p FROM items WHERE section_id=? AND branch_id=?",
+                       (sid, branch_id)).fetchone()["p"]
+    modifiers = parse_modifiers(body.get("modifiers", []))
+    stock = body.get("stock_qty")
+    if stock is not None:
+        try:
+            raw_stock = float(stock)
+            if not math.isfinite(raw_stock) or not raw_stock.is_integer():
+                raise ValueError()
+            stock = int(raw_stock)
+        except (TypeError, ValueError):
+            raise ApiError(400, "Stock must be a non-negative whole number or null")
+        if stock < 0:
+            raise ApiError(400, "Stock cannot be negative")
+    image_url = str(body.get("image_url") or "").strip()
+    if image_url and not image_url.startswith("/item-images/"):
+        raise ApiError(400, "Image must be uploaded to this server")
+    cur = conn.execute("INSERT INTO items(section_id, name, price, description, position, active, branch_id, stock_qty, image_url, modifiers) "
+                       "VALUES(?,?,?,?,?,1,?,?,?,?)",
+                       (sid, name, price, str(body.get("description") or "")[:300], pos, branch_id,
+                        stock, image_url[:500], json.dumps(modifiers, ensure_ascii=False)))
+    bump_rev(conn); conn.commit()
+    return {"ok": True, "item_id": cur.lastrowid}
+
+def h_item_update(args, body, conn):
+    branch_id = get_branch_id(body)
+    iid = int(args[0])
+    it = conn.execute("SELECT * FROM items WHERE id=? AND branch_id=?", (iid, branch_id)).fetchone()
+    if not it:
+        raise ApiError(404, "Item not found")
+    if "name" in body:
+        name = str(body["name"]).strip()
+        if not name:
+            raise ApiError(400, "Name required")
+        conn.execute("UPDATE items SET name=? WHERE id=? AND branch_id=?", (name, iid, branch_id))
+    if "price" in body:
+        try:
+            price = round(float(body["price"]), 2)
+            if not math.isfinite(price) or price < 0:
+                raise ValueError()
+            conn.execute("UPDATE items SET price=? WHERE id=? AND branch_id=?", (price, iid, branch_id))
+        except Exception:
+            raise ApiError(400, "Bad price")
+    if "description" in body:
+        conn.execute("UPDATE items SET description=? WHERE id=? AND branch_id=?",
+                     (str(body["description"])[:300], iid, branch_id))
+    if "stock_qty" in body:
+        stock = body["stock_qty"]
+        if stock is not None:
+            try:
+                raw_stock = float(stock)
+                if not math.isfinite(raw_stock) or not raw_stock.is_integer():
+                    raise ValueError()
+                stock = int(raw_stock)
+            except (TypeError, ValueError):
+                raise ApiError(400, "Stock must be a non-negative whole number or null")
+            if stock < 0:
+                raise ApiError(400, "Stock cannot be negative")
+        conn.execute("UPDATE items SET stock_qty=? WHERE id=? AND branch_id=?",
+                     (stock, iid, branch_id))
+    if "image_url" in body:
+        image_url = str(body["image_url"] or "").strip()
+        if image_url and not image_url.startswith("/item-images/"):
+            raise ApiError(400, "Image must be uploaded to this server")
+        conn.execute("UPDATE items SET image_url=? WHERE id=? AND branch_id=?",
+                     (image_url[:500], iid, branch_id))
+    if "modifiers" in body:
+        modifiers = parse_modifiers(body["modifiers"])
+        conn.execute("UPDATE items SET modifiers=? WHERE id=? AND branch_id=?",
+                     (json.dumps(modifiers, ensure_ascii=False), iid, branch_id))
+    if "section_id" in body:
+        sid = body["section_id"]
+        if not conn.execute("SELECT 1 FROM sections WHERE id=? AND branch_id=?",
+                            (sid, branch_id)).fetchone():
+            raise ApiError(400, "Bad section")
+        conn.execute("UPDATE items SET section_id=? WHERE id=? AND branch_id=?", (sid, iid, branch_id))
+    for k in ("position", "active"):
+        if k in body:
+            conn.execute("UPDATE items SET %s=? WHERE id=? AND branch_id=?" % k,
+                         (int(body[k]), iid, branch_id))
+    bump_rev(conn); conn.commit()
+    return {"ok": True}
+
+def h_item_delete(args, body, conn):
+    branch_id = get_branch_id(body)
+    conn.execute("DELETE FROM items WHERE id=? AND branch_id=?", (int(args[0]), branch_id))
+    bump_rev(conn); conn.commit()
+    return {"ok": True}
+
+def h_staff_create(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    name = str(body.get("name") or "").strip()
+    if not name:
+        raise ApiError(400, "Name required")
+    tables = json.dumps(parse_tables(body.get("tables")))
+    role = str(body.get("role") or "waiter").strip()
+    if role not in ("waiter", "kitchen"):
+        role = "waiter"
+    kitchen_station = str(body.get("kitchen_station") or "").strip()[:100]
+    pin_raw = str(body.get("pin") or "").strip()
+    pin_hash = hashlib.sha256(pin_raw.encode()).hexdigest() if pin_raw else ""
+    cur = conn.execute(
+        "INSERT INTO staff(name, tables, active, branch_id, pin, role, kitchen_station) VALUES(?,?,?,?,?,?,?)",
+        (name, tables, int(bool(body.get("active", 1))), branch_id, pin_hash, role, kitchen_station))
+    bump_rev(conn); conn.commit()
+    return {"ok": True, "staff_id": cur.lastrowid}
+
+def h_staff_update(args, body, conn):
+    branch_id = get_branch_id(body)
+    sid = int(args[0])
+    st = conn.execute("SELECT * FROM staff WHERE id=? AND branch_id=?", (sid, branch_id)).fetchone()
+    if not st:
+        raise ApiError(404, "Waiter not found")
+    if "name" in body:
+        name = str(body["name"]).strip()
+        if not name:
+            raise ApiError(400, "Name required")
+        conn.execute("UPDATE staff SET name=? WHERE id=? AND branch_id=?", (name, sid, branch_id))
+    if "tables" in body:
+        conn.execute("UPDATE staff SET tables=? WHERE id=? AND branch_id=?",
+                     (json.dumps(parse_tables(body["tables"])), sid, branch_id))
+    if "active" in body:
+        conn.execute("UPDATE staff SET active=? WHERE id=? AND branch_id=?",
+                     (int(body["active"]), sid, branch_id))
+    if "role" in body:
+        role = str(body["role"] or "waiter").strip()
+        if role not in ("waiter", "kitchen"):
+            role = "waiter"
+        conn.execute("UPDATE staff SET role=? WHERE id=? AND branch_id=?", (role, sid, branch_id))
+    if "kitchen_station" in body:
+        conn.execute("UPDATE staff SET kitchen_station=? WHERE id=? AND branch_id=?",
+                     (str(body["kitchen_station"] or "").strip()[:100], sid, branch_id))
+    if "pin" in body:
+        pin_raw = str(body["pin"] or "").strip()
+        pin_hash = hashlib.sha256(pin_raw.encode()).hexdigest() if pin_raw else ""
+        conn.execute("UPDATE staff SET pin=? WHERE id=? AND branch_id=?", (pin_hash, sid, branch_id))
+    bump_rev(conn); conn.commit()
+    return {"ok": True, "staff_id": sid}
+
+def h_staff_delete(args, body, conn):
+    branch_id = get_branch_id(body)
+    conn.execute("DELETE FROM staff WHERE id=? AND branch_id=?", (int(args[0]), branch_id))
+    bump_rev(conn); conn.commit()
+    return {"ok": True}
+
+def h_branch_create(args, body, conn):
+    source_id = get_branch_id(body)
+    require_branch(conn, source_id)
+    name = str(body.get("name") or "").strip()[:100]
+    if not name:
+        raise ApiError(400, "Branch name required")
+    try:
+        cur = conn.execute("INSERT INTO branches(name) VALUES(?)", (name,))
+    except sqlite3.IntegrityError:
+        raise ApiError(409, "Branch name already exists")
+    new_id = cur.lastrowid
+    if body.get("copy_menu"):
+        section_map = {}
+        for section in conn.execute(
+                "SELECT * FROM sections WHERE branch_id=? ORDER BY position, id", (source_id,)):
+            new_section = conn.execute(
+                "INSERT INTO sections(name,position,active,branch_id,kitchen_station) VALUES(?,?,?,?,?)",
+                (section["name"], section["position"], section["active"], new_id,
+                 section["kitchen_station"] if "kitchen_station" in section.keys() else ""))
+            section_map[section["id"]] = new_section.lastrowid
+        for item in conn.execute("SELECT * FROM items WHERE branch_id=?", (source_id,)):
+            conn.execute(
+                "INSERT INTO items(section_id,name,price,description,position,active,branch_id,"
+                "stock_qty,image_url,modifiers) VALUES(?,?,?,?,?,?,?,NULL,?,?)",
+                (section_map[item["section_id"]], item["name"], item["price"], item["description"],
+                 item["position"], item["active"], new_id, item["image_url"], item["modifiers"]))
+        for staff in conn.execute("SELECT * FROM staff WHERE branch_id=?", (source_id,)):
+            conn.execute(
+                "INSERT INTO staff(name,tables,active,branch_id,role,kitchen_station) VALUES(?,?,?,?,?,?)",
+                (staff["name"], staff["tables"], staff["active"], new_id,
+                 staff["role"] if "role" in staff.keys() else "waiter",
+                 staff["kitchen_station"] if "kitchen_station" in staff.keys() else ""))
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True, "branch_id": new_id}
+
+def h_reservation_create(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    name = str(body.get("guest_name") or "").strip()[:120]
+    contact = str(body.get("contact") or "").strip()[:120]
+    note = str(body.get("note") or "").strip()[:300]
+    try:
+        starts_at = float(body.get("starts_at"))
+        raw_party_size = float(body.get("party_size"))
+        if not math.isfinite(raw_party_size) or not raw_party_size.is_integer():
+            raise ValueError()
+        party_size = int(raw_party_size)
+        if body.get("table_no") not in (None, ""):
+            raw_table = float(body["table_no"])
+            if not math.isfinite(raw_table) or not raw_table.is_integer():
+                raise ValueError()
+            table_no = int(raw_table)
+        else:
+            table_no = None
+    except (TypeError, ValueError):
+        raise ApiError(400, "Invalid reservation date, party size, or table")
+    if not name or not math.isfinite(starts_at) or starts_at <= time.time() or not 1 <= party_size <= 50:
+        raise ApiError(400, "Reservation needs a guest name, future date, and party size from 1 to 50")
+    if table_no is not None and table_no <= 0:
+        raise ApiError(400, "Table must be a positive number")
+    cur = conn.execute(
+        "INSERT INTO reservations(branch_id,guest_name,contact,starts_at,party_size,table_no,status,note,created_at) "
+        "VALUES(?,?,?,?,?,?,'booked',?,?)",
+        (branch_id, name, contact, starts_at, party_size, table_no, note, time.time()))
+    bump_rev(conn); conn.commit()
+    return {"ok": True, "reservation_id": cur.lastrowid}
+
+def h_reservation_update(args, body, conn):
+    branch_id = get_branch_id(body)
+    reservation_id = int(args[0])
+    reservation = conn.execute("SELECT * FROM reservations WHERE id=? AND branch_id=?",
+                               (reservation_id, branch_id)).fetchone()
+    if not reservation:
+        raise ApiError(404, "Reservation not found")
+    status = body.get("status", reservation["status"])
+    if status not in ("booked", "seated", "cancelled", "no_show"):
+        raise ApiError(400, "Invalid reservation status")
+    if "guest_name" in body:
+        name = str(body["guest_name"] or "").strip()[:120]
+        if not name:
+            raise ApiError(400, "Guest name required")
+        conn.execute("UPDATE reservations SET guest_name=? WHERE id=?", (name, reservation_id))
+    if "contact" in body:
+        conn.execute("UPDATE reservations SET contact=? WHERE id=?",
+                     (str(body["contact"] or "").strip()[:120], reservation_id))
+    if "note" in body:
+        conn.execute("UPDATE reservations SET note=? WHERE id=?",
+                     (str(body["note"] or "").strip()[:300], reservation_id))
+    if "table_no" in body:
+        table_no = body["table_no"]
+        if table_no not in (None, ""):
+            try:
+                raw_table = float(table_no)
+                if not math.isfinite(raw_table) or not raw_table.is_integer():
+                    raise ValueError()
+                table_no = int(raw_table)
+            except (TypeError, ValueError):
+                raise ApiError(400, "Invalid table")
+        else:
+            table_no = None
+        conn.execute("UPDATE reservations SET table_no=? WHERE id=?", (table_no, reservation_id))
+    conn.execute("UPDATE reservations SET status=? WHERE id=?", (status, reservation_id))
+    bump_rev(conn); conn.commit()
+    return {"ok": True}
+
+def h_payment_create(args, body, conn):
+    branch_id = get_branch_id(body)
+    order_id = int(args[0])
+    order = get_order(conn, order_id)
+    if order["branch_id"] != branch_id or order["status"] == "cancelled":
+        raise ApiError(404, "Order not found")
+    try:
+        amount = round(float(body.get("amount")), 2)
+    except (TypeError, ValueError):
+        raise ApiError(400, "Invalid payment amount")
+    method = str(body.get("method") or "").lower()
+    if not math.isfinite(amount) or amount <= 0 or method not in ("cash", "card", "other"):
+        raise ApiError(400, "Payment must be positive and use cash, card, or other")
+    paid = sum(row["amount"] for row in conn.execute(
+        "SELECT amount-refunded_amount amount FROM payments WHERE order_id=?", (order_id,)))
+    if amount > round(order["total"] - paid, 2) + 0.001:
+        raise ApiError(409, "Payment exceeds the remaining balance")
+    allocations = body.get("allocations") or []
+    if not isinstance(allocations, list):
+        raise ApiError(400, "Invalid bill split")
+    cur = conn.execute(
+        "INSERT INTO payments(order_id,amount,method,note,created_at) VALUES(?,?,?,?,?)",
+        (order_id, amount, method, str(body.get("note") or "")[:200], time.time()))
+    payment_id = cur.lastrowid
+    if allocations:
+        allocated_total = 0.0
+        for allocation in allocations:
+            try:
+                line_id = int(allocation["line_id"])
+                qty = float(allocation["qty"])
+            except (KeyError, TypeError, ValueError):
+                raise ApiError(400, "Invalid bill split allocation")
+            if not math.isfinite(qty) or not qty.is_integer():
+                raise ApiError(400, "Split quantities must be whole numbers")
+            line = conn.execute(
+                "SELECT * FROM order_items WHERE id=? AND order_id=? AND status!='cancelled'",
+                (line_id, order_id)).fetchone()
+            if not line or qty <= 0 or qty > line["qty"]:
+                raise ApiError(400, "Invalid bill split quantity")
+            already = conn.execute(
+                "SELECT COALESCE(SUM(pa.qty * (p.amount-p.refunded_amount)/p.amount),0) q FROM payment_allocations pa "
+                "JOIN payments p ON p.id=pa.payment_id WHERE pa.order_item_id=? AND p.order_id=?",
+                (line_id, order_id)).fetchone()["q"]
+            if already + qty > line["qty"]:
+                raise ApiError(409, "Item quantity already assigned to another split")
+            conn.execute("INSERT INTO payment_allocations(payment_id,order_item_id,qty) VALUES(?,?,?)",
+                         (payment_id, line_id, qty))
+            allocated_total += line["price"] * qty
+        if abs(round(allocated_total, 2) - amount) > 0.01:
+            raise ApiError(400, "Payment amount must match the selected items")
+    bump_rev(conn); conn.commit()
+    return {"ok": True, "payment_id": payment_id, "balance": round(order["total"] - paid - amount, 2)}
+
+def h_bill_request(args, body, conn):
+    branch_id = get_branch_id(body)
+    order_id = int(args[0])
+    order = conn.execute("SELECT branch_id,status FROM orders WHERE id=?", (order_id,)).fetchone()
+    if not order or order["branch_id"] != branch_id:
+        raise ApiError(404, "Order not found")
+    if order["status"] in ("served", "cancelled"):
+        raise ApiError(400, "Closed orders cannot request a bill")
+    conn.execute("UPDATE orders SET bill_requested=1, updated_at=? WHERE id=?",
+                 (time.time(), order_id))
+    bump_rev(conn); conn.commit()
+    return {"ok": True}
+
+def h_payment_refund(args, body, conn):
+    branch_id = get_branch_id(body)
+    payment_id = int(args[0])
+    payment = conn.execute(
+        "SELECT p.*,o.branch_id FROM payments p JOIN orders o ON o.id=p.order_id WHERE p.id=?",
+        (payment_id,)).fetchone()
+    if not payment or payment["branch_id"] != branch_id:
+        raise ApiError(404, "Payment not found")
+    try:
+        amount = round(float(body.get("amount")), 2)
+    except (TypeError, ValueError):
+        raise ApiError(400, "Invalid refund amount")
+    remaining = round(payment["amount"] - payment["refunded_amount"], 2)
+    if not math.isfinite(amount) or amount <= 0 or amount > remaining + 0.001:
+        raise ApiError(400, "Refund must be positive and no greater than the unrefunded payment")
+    conn.execute("UPDATE payments SET refunded_amount=refunded_amount+? WHERE id=?",
+                 (amount, payment_id))
+    bump_rev(conn); conn.commit()
+    return {"ok": True, "refunded": amount, "remaining": round(remaining - amount, 2)}
+
+def h_sales(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    period = body.get("period", "7d")
+    days = {"7d": 7, "30d": 30, "90d": 90}.get(period)
+    if not days:
+        raise ApiError(400, "Period must be 7d, 30d, or 90d")
+    start = time.time() - days * 86400
+    daily = [dict(row) for row in conn.execute(
+        "SELECT date(p.created_at,'unixepoch','localtime') day, "
+        "ROUND(SUM(p.amount-p.refunded_amount),2) revenue, COUNT(*) payments "
+        "FROM payments p JOIN orders o ON o.id=p.order_id "
+        "WHERE o.branch_id=? AND p.created_at>=? GROUP BY day HAVING revenue>0 ORDER BY day",
+        (branch_id, start))]
+    top_items = [dict(row) for row in conn.execute(
+        "SELECT oi.name, SUM(oi.qty) quantity, ROUND(SUM(oi.price*oi.qty),2) value "
+        "FROM order_items oi JOIN orders o ON o.id=oi.order_id "
+        "WHERE o.branch_id=? AND o.created_at>=? AND oi.status!='cancelled' "
+        "GROUP BY oi.name ORDER BY quantity DESC LIMIT 10", (branch_id, start))]
+    return {"ok": True, "period": period, "daily": daily, "top_items": top_items}
+
+def h_item_image(args, body, conn):
+    branch_id = get_branch_id(body)
+    item_id = int(args[0])
+    if not conn.execute("SELECT 1 FROM items WHERE id=? AND branch_id=?",
+                        (item_id, branch_id)).fetchone():
+        raise ApiError(404, "Item not found")
+    mime_types = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
+    extension = mime_types.get(body.get("mime"))
+    if not extension:
+        raise ApiError(400, "Upload PNG, JPEG, or WebP images")
+    try:
+        image = base64.b64decode(body.get("data") or "", validate=True)
+    except (ValueError, TypeError):
+        raise ApiError(400, "Invalid image data")
+    if not image or len(image) > 2_000_000:
+        raise ApiError(413, "Image must be between 1 byte and 2 MB")
+    valid_signature = (
+        (extension == "png" and image.startswith(b"\x89PNG\r\n\x1a\n")) or
+        (extension == "jpg" and image.startswith(b"\xff\xd8\xff")) or
+        (extension == "webp" and len(image) >= 12 and image[:4] == b"RIFF" and image[8:12] == b"WEBP")
+    )
+    if not valid_signature:
+        raise ApiError(400, "Image content does not match its format")
+    os.makedirs(IMAGES_DIR, exist_ok=True)
+    filename = "%d.%s" % (item_id, extension)
+    path = os.path.join(IMAGES_DIR, filename)
+    with open(path, "wb") as image_file:
+        image_file.write(image)
+    image_url = "/item-images/" + filename
+    conn.execute("UPDATE items SET image_url=? WHERE id=? AND branch_id=?",
+                 (image_url, item_id, branch_id))
+    bump_rev(conn); conn.commit()
+    return {"ok": True, "image_url": image_url}
+
+def h_settings(args, body, conn):
+    global CONFIG
+    allowed = ("restaurant_name", "currency", "printer_ip", "printer_port", "autoprint", "admin_pin", "port")
+    for k in allowed:
+        if k in body:
+            v = body[k]
+            if k in ("printer_port", "port") and v not in ("", None):
+                v = int(v)
+            if k == "autoprint":
+                v = bool(v)
+            if isinstance(v, str):
+                v = v[:200]
+            CONFIG[k] = v
+    save_config(CONFIG)
+    return {"ok": True}
+
+def h_print(args, body, conn):
+    order = get_order(conn, int(args[0]), with_lines=False)
+    if order["branch_id"] != get_branch_id(body):
+        raise ApiError(404, "Order not found")
+    return print_ticket(int(args[0]))
+
+def h_export(args, body, conn):
+    data = h_state(args, body, conn)
+    branch_id = data["branch_id"]
+    data["orders"] = []
+    for row in conn.execute(
+            "SELECT * FROM orders WHERE branch_id=? ORDER BY created_at DESC", (branch_id,)):
+        order = dict(row)
+        order["lines"] = [dict(line) for line in conn.execute(
+            "SELECT * FROM order_items WHERE order_id=? ORDER BY id", (order["id"],))]
+        order["total"] = order_total(order["lines"])
+        order["paid"] = round(sum(payment["amount"] for payment in conn.execute(
+            "SELECT amount-refunded_amount amount FROM payments WHERE order_id=?", (order["id"],))), 2)
+        order["balance"] = round(order["total"] - order["paid"], 2)
+        data["orders"].append(order)
+    data["payments"] = [dict(row) for row in conn.execute(
+        "SELECT p.* FROM payments p JOIN orders o ON o.id=p.order_id "
+        "WHERE o.branch_id=? ORDER BY p.created_at", (branch_id,))]
+    data["reservations"] = [dict(row) for row in conn.execute(
+        "SELECT * FROM reservations WHERE branch_id=? ORDER BY starts_at", (branch_id,))]
+    data.pop("now", None)
+    return {"ok": True, "exported_at": time.time(), "data": data}
+
+ROUTES = [
+    ("GET",    r"^/api/state$",                     h_state,          False),
+    ("POST",   r"^/api/orders$",                    h_order_create,   False),
+    ("POST",   r"^/api/orders/(\d+)/status$",       h_order_status,   False),
+    ("POST",   r"^/api/orders/(\d+)/lines/(\d+)/status$", h_line_status, False),
+    ("GET",    r"^/api/ticket/(\d+)\.html$",        h_ticket,         False),
+    ("POST",   r"^/api/print/(\d+)$",               h_print,          False),
+    ("GET",    r"^/api/export$",                    h_export,         True),
+    ("POST",   r"^/api/sections$",                  h_section_create, True),
+    ("PUT",    r"^/api/sections/(\d+)$",            h_section_update, True),
+    ("DELETE", r"^/api/sections/(\d+)$",            h_section_delete, True),
+    ("POST",   r"^/api/items$",                     h_item_create,    True),
+    ("PUT",    r"^/api/items/(\d+)$",               h_item_update,    True),
+    ("DELETE", r"^/api/items/(\d+)$",               h_item_delete,    True),
+    ("POST",   r"^/api/staff$",                     h_staff_create,   True),
+    ("PUT",    r"^/api/staff/(\d+)$",               h_staff_update,   True),
+    ("DELETE", r"^/api/staff/(\d+)$",               h_staff_delete,   True),
+    ("POST",   r"^/api/staff/auth$",                h_staff_auth,     False),
+    ("PUT",    r"^/api/settings$",                  h_settings,       True),
+    ("POST",   r"^/api/branches$",                  h_branch_create,  True),
+    ("POST",   r"^/api/reservations$",              h_reservation_create, True),
+    ("PUT",    r"^/api/reservations/(\d+)$",        h_reservation_update, True),
+    ("POST",   r"^/api/orders/(\d+)/payments$",     h_payment_create, True),
+    ("POST",   r"^/api/payments/(\d+)/refund$",     h_payment_refund, True),
+    ("PUT",    r"^/api/orders/(\d+)/bill$",         h_bill_request,   False),
+    ("GET",    r"^/api/sales$",                     h_sales,          True),
+    ("PUT",    r"^/api/items/(\d+)/image$",         h_item_image,     True),
+]
+
+# ---------------------------------------------------------------- HTTP server
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _audit_request(self, method, handler):
+        started = time.time()
+        self._audit_status = 500
+        try:
+            return handler()
+        finally:
+            now = datetime.datetime.now().astimezone()
+            path = urlparse(self.path).path
+            needs_admin = any(m == method and re.match(pattern, path) and admin
+                              for m, pattern, _fn, admin in ROUTES)
+            try:
+                admin = str(self.headers.get("X-Admin-Pin", "")) == str(CONFIG.get("admin_pin", ""))
+            except Exception:
+                admin = False
+            record = {
+                "event_id": str(uuid.uuid4()),
+                "date": now.strftime("%d/%m/%Y"),
+                "timestamp": now.strftime("%d/%m/%Y %H:%M:%S.%f")[:-3],
+                "timezone": now.strftime("%Z") or "local",
+                "operation": method,
+                "path": path,
+                "status": self._audit_status,
+                "result": "success" if 200 <= self._audit_status < 400 else "failure",
+                "submitted_fields": getattr(self, "_audit_fields", []),
+                "change_summary": getattr(self, "_audit_summary", {}),
+                "resource_ids": getattr(self, "_audit_resource_ids", {}),
+                "actor": "admin" if admin else ("admin_required" if needs_admin else "client"),
+                "claimed_role": str(self.headers.get("X-Actor-Role", "") or "")[:24],
+                "claimed_actor_id": str(self.headers.get("X-Actor-ID", "") or "")[:64],
+                "branch_id": self.headers.get("X-Branch-ID"),
+                "client_ip": self.client_address[0],
+                "duration_ms": round((time.time() - started) * 1000, 1),
+            }
+            try:
+                os.makedirs(AUDIT_DIR, exist_ok=True)
+                log_path = os.path.join(AUDIT_DIR, now.strftime("%d-%m-%Y") + ".jsonl")
+                with _audit_lock, open(log_path, "a", encoding="utf-8") as log:
+                    log.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except OSError as exc:
+                # Keep the service available, but make audit-write failures visible.
+                print("AUDIT LOG WRITE FAILED: %s" % exc, flush=True)
+    server_version = "RestaurantServer/1.0"
+
+    def log_message(self, fmt, *args):
+        pass  # keep the console quiet
+
+    def _headers(self, code=200, ctype="application/json", extra=None):
+        self._audit_status = code
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Pin, X-Branch-ID, X-Actor-Role, X-Actor-ID")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE")
+        if extra:
+            for k, v in extra.items():
+                self.send_header(k, v)
+        self.end_headers()
+
+    def _json(self, obj, code=200):
+        id_keys = {"id", "item_id", "order_id", "section_id", "staff_id",
+                   "reservation_id", "payment_id", "branch_id"}
+        if isinstance(obj, dict):
+            self._audit_resource_ids = {k: obj[k] for k in id_keys
+                                        if k in obj and isinstance(obj[k], (int, str))}
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self._headers(code, extra={"Content-Length": str(len(body))})
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self._audit_request("OPTIONS", lambda: self._headers(200))
+
+    def _body(self, max_size=1_000_000):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > max_size:
+            raise ApiError(413, "Body too large")
+        if n == 0:
+            return {}
+        raw = self.rfile.read(n)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise ApiError(400, "Invalid JSON body")
+
+    def h_events(self):
+        """SSE long-poll handler — writes raw HTTP, never uses _headers/_json."""
+        raw = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: keep-alive\r\n"
+            "X-Accel-Buffering: no\r\n"
+            "\r\n"
+        )
+        try:
+            self.wfile.write(raw.encode("utf-8"))
+            self.wfile.flush()
+            self._audit_status = 200
+        except (OSError, BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+            return
+
+        conn = db()
+        try:
+            rev = get_rev(conn)
+        finally:
+            conn.close()
+
+        # Send initial rev immediately
+        try:
+            msg = "data: {\"rev\": %d}\n\n" % rev
+            self.wfile.write(msg.encode("utf-8"))
+            self.wfile.flush()
+        except (OSError, BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+            return
+
+        while True:
+            time.sleep(0.8)
+            try:
+                conn = db()
+                try:
+                    new_rev = get_rev(conn)
+                finally:
+                    conn.close()
+                if new_rev != rev:
+                    rev = new_rev
+                    msg = "data: {\"rev\": %d}\n\n" % rev
+                    self.wfile.write(msg.encode("utf-8"))
+                    self.wfile.flush()
+            except (OSError, BrokenPipeError, ConnectionResetError):
+                break
+            except Exception:
+                break
+
+        self.close_connection = True
+
+    def do_GET(self):
+        self._audit_request("GET", self._handle_get)
+
+    def _handle_get(self):
+        parsed = urlparse(self.path)
+        p = parsed.path
+        # SSE endpoint — handle before normal routing
+        if p == "/api/events":
+            self.h_events()
+            return
+        image_match = re.fullmatch(r"/item-images/([1-9]\d*)\.(png|jpg|webp)", p)
+        if image_match:
+            path = os.path.join(IMAGES_DIR, image_match.group(0).split("/")[-1])
+            if not os.path.isfile(path):
+                self._json({"ok": False, "error": "Image not found"}, 404)
+                return
+            mime = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}[image_match.group(2)]
+            with open(path, "rb") as image_file:
+                data = image_file.read()
+            self._headers(200, mime, extra={"Content-Length": str(len(data))})
+            self.wfile.write(data)
+            return
+        if p in ("/", "/app.html", "/index.html"):
+            try:
+                with open(APP_PATH, "rb") as f:
+                    app = f.read()
+            except Exception:
+                self._json({"ok": False, "error": "app.html not found — run build_app.py"}, 500)
+                return
+            self._headers(200, "text/html", extra={"Content-Length": str(len(app))})
+            self.wfile.write(app)
+            return
+        self._route("GET", p, parse_qs(parsed.query))
+
+    def do_POST(self):
+        self._audit_request("POST", lambda: self._route("POST", urlparse(self.path).path))
+
+    def do_PUT(self):
+        self._audit_request("PUT", lambda: self._route("PUT", urlparse(self.path).path))
+
+    def do_DELETE(self):
+        self._audit_request("DELETE", lambda: self._route("DELETE", urlparse(self.path).path))
+
+    def _route(self, method, path, query=None):
+        for m, pattern, fn, needs_admin in ROUTES:
+            if m != method:
+                continue
+            match = re.match(pattern, path)
+            if not match:
+                continue
+            try:
+                body = (self._body(3_000_000 if re.match(r"^/api/items/\d+/image$", path) else 1_000_000)
+                        if method in ("POST", "PUT", "DELETE")
+                        else {"lang": (query or {}).get("lang", ["en"])[0],
+                              "period": (query or {}).get("period", ["7d"])[0]})
+                body["branch_id"] = self.headers.get("X-Branch-ID") or (
+                    (query or {}).get("branch_id", [body.get("branch_id", 1)])[0])
+                # Log the submitted field names, plus a strict allowlist of low-risk
+                # values. Never copy free text, personal details, credentials,
+                # payment amounts, or uploaded image data into the audit log.
+                self._audit_fields = sorted(k for k in body if k != "branch_id")
+                safe_values = {"price", "qty", "status", "table_no", "party_size",
+                               "active", "position", "stock_qty", "section_id",
+                               "copy_menu", "lang", "period"}
+                self._audit_summary = {k: body[k] for k in self._audit_fields
+                                       if k in safe_values and isinstance(body[k], (str, int, float, bool, type(None)))}
+                if any(token in urlparse(self.path).path for token in ("/sections", "/items", "/branches")):
+                    for key in ("name", "kitchen_station"):
+                        if isinstance(body.get(key), str):
+                            self._audit_summary[key] = body[key][:100]
+                if needs_admin:
+                    check_admin(self.headers)
+                conn = db()
+                try:
+                    result = fn(match.groups(), body, conn)
+                finally:
+                    conn.close()
+                if isinstance(result, str):          # ticket HTML view
+                    b = result.encode("utf-8")
+                    self._headers(200, "text/html", extra={"Content-Length": str(len(b))})
+                    self.wfile.write(b)
+                else:
+                    self._json(result)
+            except ApiError as e:
+                self._json({"ok": False, "error": e.msg}, e.code)
+            except Exception as e:
+                self._json({"ok": False, "error": "Server error: %s" % e}, 500)
+            return
+        self._json({"ok": False, "error": "Not found"}, 404)
+
+def lan_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+if __name__ == "__main__":
+    init_db()
+    port = int(os.environ.get("PORT") or CONFIG.get("port") or 8080)
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    print("Restaurant ordering server running")
+    print("  On this machine : http://localhost:%d" % port)
+    print("  On the LAN      : http://%s:%d   <- open this on the tablets" % (lan_ip(), port))
+    print("  Data            : %s" % DB_PATH)
+    print("  Admin PIN       : %s  (config.json)" % CONFIG["admin_pin"])
+    print("  Printer         : %s" % ((CONFIG.get("printer_ip") or "not configured") +
+                                   (":%s" % CONFIG.get("printer_port") if CONFIG.get("printer_ip") else "")))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Stopped.")
