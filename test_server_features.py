@@ -217,6 +217,64 @@ class RestaurantFeatureTests(unittest.TestCase):
             "SELECT image_path FROM products WHERE id=?", (product_id,)).fetchone()
         self.assertEqual(saved["image_path"], uploaded["image_url"])
 
+    def test_phase7_bill_payment_refund_snapshot_and_sales(self):
+        section = self.conn.execute("SELECT id FROM sections LIMIT 1").fetchone()
+        product = server.h_catalog_product_create([], {
+            "branch_id": 1,
+            "section_id": section["id"],
+            "name": "Finance Pizza",
+            "variants": [{
+                "name": "Large", "price_cents": 1600,
+                "stock_qty": None, "is_default": 1, "active": 1,
+            }],
+        }, self.conn)
+        variant = self.conn.execute(
+            "SELECT id FROM product_variants WHERE product_id=?",
+            (product["product_id"],)).fetchone()
+        order = server.h_catalog_order_create({
+            "table_no": 15,
+            "lines": [{
+                "product_id": product["product_id"],
+                "variant_id": variant["id"],
+                "modifier_option_ids": [],
+                "qty": 2,
+            }],
+        }, self.conn, 1)
+        line = self.conn.execute(
+            "SELECT id FROM order_items WHERE order_id=?",
+            (order["order_id"],)).fetchone()
+        bill = server.h_bill_open([], {
+            "branch_id": 1,
+            "table_no": 15,
+            "order_line_ids": [line["id"]],
+        }, self.conn)
+        bill_id = bill["bill_id"]
+        snapshot = server.h_bill_get([str(bill_id)], {"branch_id": 1}, self.conn)
+        self.assertEqual(snapshot["total_cents"], 3200)
+        server.h_catalog_variant_update([str(variant["id"])], {
+            "branch_id": 1, "price_cents": 1900,
+        }, self.conn)
+        snapshot = server.h_bill_get([str(bill_id)], {"branch_id": 1}, self.conn)
+        self.assertEqual(snapshot["total_cents"], 3200)
+        payment = server.h_bill_payment_create([str(bill_id)], {
+            "branch_id": 1, "amount_cents": 2000, "method": "cash",
+        }, self.conn)
+        with self.assertRaises(server.ApiError) as error:
+            server.h_bill_payment_create([str(bill_id)], {
+                "branch_id": 1, "amount_cents": 2000, "method": "cash",
+            }, self.conn)
+        self.assertEqual(error.exception.code, 409)
+        refund = server.h_bill_refund_create([str(payment["payment_id"])], {
+            "branch_id": 1, "amount_cents": 500, "reason": "customer",
+        }, self.conn)
+        self.assertEqual(refund["remaining_cents"], 1500)
+        with self.assertRaises(server.ApiError):
+            server.h_bill_refund_create([str(payment["payment_id"])], {
+                "branch_id": 1, "amount_cents": 1600,
+            }, self.conn)
+        sales = server.h_sales([], {"branch_id": 1, "period": "7d"}, self.conn)
+        self.assertIn("daily", sales)
+
     def test_phase6_ticket_variant_modifiers_and_historical_price(self):
         section = self.conn.execute("SELECT id FROM sections LIMIT 1").fetchone()
         product = server.h_catalog_product_create([], {

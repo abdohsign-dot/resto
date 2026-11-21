@@ -262,6 +262,41 @@ CREATE TABLE IF NOT EXISTS payment_allocations (
     qty REAL NOT NULL,
     PRIMARY KEY (payment_id, order_item_id)
 );
+CREATE TABLE IF NOT EXISTS bills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_id INTEGER NOT NULL,
+    table_no INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('open','closed')),
+    opened_at REAL NOT NULL,
+    closed_at REAL
+);
+CREATE TABLE IF NOT EXISTS bill_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_id INTEGER NOT NULL,
+    order_item_id INTEGER NOT NULL,
+    qty INTEGER NOT NULL CHECK (qty > 0),
+    unit_price_cents INTEGER NOT NULL CHECK (unit_price_cents >= 0),
+    UNIQUE(bill_id, order_item_id),
+    FOREIGN KEY(bill_id) REFERENCES bills(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS bill_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_id INTEGER NOT NULL,
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+    method TEXT NOT NULL,
+    recorded_by TEXT DEFAULT '',
+    recorded_at REAL NOT NULL,
+    note TEXT DEFAULT '',
+    FOREIGN KEY(bill_id) REFERENCES bills(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS bill_refunds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    payment_id INTEGER NOT NULL,
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+    reason TEXT DEFAULT '',
+    recorded_at REAL NOT NULL,
+    FOREIGN KEY(payment_id) REFERENCES bill_payments(id) ON DELETE CASCADE
+);
 """
 
 def init_db():
@@ -2427,6 +2462,210 @@ def h_sales(args, body, conn):
         "GROUP BY oi.name ORDER BY quantity DESC LIMIT 10", (branch_id, start))]
     return {"ok": True, "period": period, "daily": daily, "top_items": top_items}
 
+def cents_value(row):
+    cents = row["unit_price_cents"] if "unit_price_cents" in row.keys() and row["unit_price_cents"] is not None else None
+    if cents is not None:
+        return int(cents)
+    return int(round(float(row["price"]) * 100))
+
+def h_bill_open(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    table_no = body.get("table_no")
+    if isinstance(table_no, bool) or not isinstance(table_no, int) or table_no <= 0:
+        raise ApiError(400, "table_no must be a positive integer")
+    existing = conn.execute(
+        "SELECT id FROM bills WHERE branch_id=? AND table_no=? AND status='open'",
+        (branch_id, table_no)).fetchone()
+    if existing:
+        return {"ok": True, "bill_id": existing["id"], "duplicate": True}
+    now = time.time()
+    bill = conn.execute(
+        "INSERT INTO bills(branch_id,table_no,status,opened_at) VALUES(?,?,'open',?)",
+        (branch_id, table_no, now))
+    bill_id = bill.lastrowid
+    line_ids = body.get("order_line_ids")
+    if line_ids is not None:
+        if not isinstance(line_ids, list):
+            conn.rollback()
+            raise ApiError(400, "order_line_ids must be a list")
+    else:
+        line_ids = [r["id"] for r in conn.execute(
+            "SELECT oi.id FROM order_items oi JOIN orders o ON o.id=oi.order_id "
+            "WHERE o.branch_id=? AND o.table_no=? "
+            "AND oi.status!='cancelled' AND o.status!='cancelled'",
+            (branch_id, table_no))]
+    try:
+        for raw_line_id in line_ids:
+            line_id = int(raw_line_id)
+            line = conn.execute(
+                "SELECT oi.*,o.branch_id,o.table_no,o.status order_status "
+                "FROM order_items oi JOIN orders o ON o.id=oi.order_id "
+                "WHERE oi.id=? AND oi.status!='cancelled'",
+                (line_id,)).fetchone()
+            if not line or line["branch_id"] != branch_id or line["table_no"] != table_no:
+                raise ApiError(404, "Order line not found")
+            conn.execute(
+                "INSERT OR IGNORE INTO bill_items"
+                "(bill_id,order_item_id,qty,unit_price_cents)"
+                " VALUES(?,?,?,?)",
+                (bill_id, line_id, int(line["qty"]), cents_value(line)))
+        bump_rev(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"ok": True, "bill_id": bill_id}
+
+def bill_total(conn, bill_id):
+    row = conn.execute(
+        "SELECT COALESCE(SUM(qty*unit_price_cents),0) total "
+        "FROM bill_items WHERE bill_id=?", (bill_id,)).fetchone()
+    return int(row["total"])
+
+def h_bill_get(args, body, conn):
+    branch_id = get_branch_id(body)
+    bill_id = int(args[0])
+    bill = conn.execute(
+        "SELECT * FROM bills WHERE id=? AND branch_id=?", (bill_id, branch_id)).fetchone()
+    if not bill:
+        raise ApiError(404, "Bill not found")
+    items = [dict(r) for r in conn.execute(
+        "SELECT bi.*,oi.name,oi.variant_name,oi.modifiers_json "
+        "FROM bill_items bi JOIN order_items oi ON oi.id=bi.order_item_id "
+        "WHERE bi.bill_id=? ORDER BY bi.id", (bill_id,))]
+    payments = [dict(r) for r in conn.execute(
+        "SELECT * FROM bill_payments WHERE bill_id=? ORDER BY recorded_at,id",
+        (bill_id,))]
+    refunded = sum(r["amount_cents"] for r in conn.execute(
+        "SELECT br.amount_cents FROM bill_refunds br "
+        "JOIN bill_payments bp ON bp.id=br.payment_id "
+        "WHERE bp.bill_id=?", (bill_id,)))
+    paid = sum(r["amount_cents"] for r in payments)
+    total = bill_total(conn, bill_id)
+    return {"ok": True, "bill": dict(bill), "items": items,
+            "payments": payments, "total_cents": total,
+            "paid_cents": paid - refunded, "balance_cents": total - (paid - refunded)}
+
+def h_bill_add_items(args, body, conn):
+    branch_id = get_branch_id(body)
+    bill_id = int(args[0])
+    bill = conn.execute(
+        "SELECT * FROM bills WHERE id=? AND branch_id=?",
+        (bill_id, branch_id)).fetchone()
+    if not bill:
+        raise ApiError(404, "Bill not found")
+    if bill["status"] != "open":
+        raise ApiError(400, "Closed bills cannot accept items")
+    ids = body.get("order_line_ids")
+    if not isinstance(ids, list):
+        raise ApiError(400, "order_line_ids must be a list")
+    try:
+        conn.execute("BEGIN")
+        for raw_line_id in ids:
+            line = conn.execute(
+                "SELECT oi.*,o.branch_id,o.table_no,o.status order_status "
+                "FROM order_items oi JOIN orders o ON o.id=oi.order_id "
+                "WHERE oi.id=? AND oi.status!='cancelled'",
+                (int(raw_line_id),)).fetchone()
+            if not line or line["branch_id"] != branch_id or line["table_no"] != bill["table_no"]:
+                raise ApiError(404, "Order line not found")
+            conn.execute(
+                "INSERT OR IGNORE INTO bill_items"
+                "(bill_id,order_item_id,qty,unit_price_cents)"
+                " VALUES(?,?,?,?)",
+                (bill_id, int(raw_line_id), int(line["qty"]), cents_value(line)))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"ok": True}
+
+def h_bill_close(args, body, conn):
+    branch_id = get_branch_id(body)
+    bill_id = int(args[0])
+    bill = conn.execute(
+        "SELECT * FROM bills WHERE id=? AND branch_id=?", (bill_id, branch_id)).fetchone()
+    if not bill:
+        raise ApiError(404, "Bill not found")
+    paid = conn.execute(
+        "SELECT COALESCE(SUM(bp.amount_cents),0) paid "
+        "FROM bill_payments bp WHERE bp.bill_id=?", (bill_id,)).fetchone()["paid"]
+    refunded = conn.execute(
+        "SELECT COALESCE(SUM(br.amount_cents),0) refunded "
+        "FROM bill_refunds br JOIN bill_payments bp ON bp.id=br.payment_id "
+        "WHERE bp.bill_id=?", (bill_id,)).fetchone()["refunded"]
+    net_paid = int(paid - refunded)
+    if net_paid < bill_total(conn, bill_id):
+        raise ApiError(400, "Bill balance must be zero before closing")
+    conn.execute("UPDATE bills SET status='closed',closed_at=? WHERE id=?",
+                 (time.time(), bill_id))
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True}
+
+def h_bill_payment_create(args, body, conn):
+    branch_id = get_branch_id(body)
+    bill_id = int(args[0])
+    bill = conn.execute(
+        "SELECT * FROM bills WHERE id=? AND branch_id=?", (bill_id, branch_id)).fetchone()
+    if not bill:
+        raise ApiError(404, "Bill not found")
+    if bill["status"] != "open":
+        raise ApiError(400, "Closed bills cannot accept payments")
+    amount = int(body.get("amount_cents")) if body.get("amount_cents") is not None else None
+    if amount is None or isinstance(body.get("amount_cents"), bool) or amount <= 0:
+        raise ApiError(400, "amount_cents must be a positive integer")
+    method = str(body.get("method") or "").lower()
+    if method not in ("cash", "card", "other"):
+        raise ApiError(400, "Invalid payment method")
+    paid = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) paid FROM bill_payments "
+        "WHERE bill_id=?", (bill_id,)).fetchone()["paid"]
+    refunded = conn.execute(
+        "SELECT COALESCE(SUM(br.amount_cents),0) refunded "
+        "FROM bill_refunds br JOIN bill_payments bp ON bp.id=br.payment_id "
+        "WHERE bp.bill_id=?", (bill_id,)).fetchone()["refunded"]
+    balance = bill_total(conn, bill_id) - int(paid - refunded)
+    if amount > balance:
+        raise ApiError(409, "Payment exceeds the remaining balance")
+    cur = conn.execute(
+        "INSERT INTO bill_payments"
+        "(bill_id,amount_cents,method,recorded_by,recorded_at,note)"
+        " VALUES(?,?,?,?,?,?)",
+        (bill_id, amount, method, str(body.get("recorded_by") or "")[:80],
+         time.time(), str(body.get("note") or "")[:200]))
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True, "payment_id": cur.lastrowid,
+            "balance_cents": balance - amount}
+
+def h_bill_refund_create(args, body, conn):
+    branch_id = get_branch_id(body)
+    payment_id = int(args[0])
+    payment = conn.execute(
+        "SELECT bp.*,b.branch_id FROM bill_payments bp "
+        "JOIN bills b ON b.id=bp.bill_id WHERE bp.id=?",
+        (payment_id,)).fetchone()
+    if not payment or payment["branch_id"] != branch_id:
+        raise ApiError(404, "Payment not found")
+    amount = int(body.get("amount_cents")) if body.get("amount_cents") is not None else None
+    if amount is None or isinstance(body.get("amount_cents"), bool) or amount <= 0:
+        raise ApiError(400, "amount_cents must be a positive integer")
+    refunded = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) refunded "
+        "FROM bill_refunds WHERE payment_id=?", (payment_id,)).fetchone()["refunded"]
+    remaining = int(payment["amount_cents"] - refunded)
+    if amount > remaining:
+        raise ApiError(400, "Refund cannot exceed the payment")
+    conn.execute(
+        "INSERT INTO bill_refunds(payment_id,amount_cents,reason,recorded_at)"
+        " VALUES(?,?,?,?)",
+        (payment_id, amount, str(body.get("reason") or "")[:200], time.time()))
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True, "remaining_cents": remaining - amount}
+
 def h_item_image(args, body, conn):
     branch_id = get_branch_id(body)
     item_id = int(args[0])
@@ -2591,6 +2830,13 @@ ROUTES = [
     ("POST",   r"^/api/payments/(\d+)/refund$",     h_payment_refund, True),
     ("PUT",    r"^/api/orders/(\d+)/bill$",         h_bill_request,   False),
     ("GET",    r"^/api/sales$",                     h_sales,          True),
+    ("POST",   r"^/api/bills$",                     h_bill_open,      True),
+    ("GET",    r"^/api/bills/(\d+)$",               h_bill_get,       True),
+    ("POST",   r"^/api/bills/(\d+)/items$",         h_bill_add_items, True),
+    ("POST",   r"^/api/bills/(\d+)/close$",         h_bill_close,     True),
+    ("POST",   r"^/api/bills/(\d+)/payments$",      h_bill_payment_create, True),
+    ("POST",   r"^/api/payments/(\d+)/refunds$",    h_bill_refund_create, True),
+    ("GET",    r"^/api/reports/sales$",             h_sales,          True),
     ("PUT",    r"^/api/items/(\d+)/image$",         h_item_image,     True),
     ("PUT",    r"^/api/products/(\d+)/image$",      h_product_image,  True),
 ]

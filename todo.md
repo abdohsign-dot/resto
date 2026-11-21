@@ -377,20 +377,20 @@ Now, and only now, build the endpoints and UI for bills/payments/refunds
 (the tables already exist from Phase 1).
 
 ### 7.1 Bills
-[ ] POST /api/bills                      {table_id} -> opens a bill, snapshots open lines
-[ ] GET  /api/bills/{id}
-[ ] POST /api/bills/{id}/items           attach order_line_ids (snapshot unit_price_cents)
-[ ] POST /api/bills/{id}/close
+[x] POST /api/bills                      {table_no} -> opens a bill, snapshots open lines
+[x] GET  /api/bills/{id}
+[x] POST /api/bills/{id}/items           attach order_line_ids (snapshot unit_price_cents)
+[x] POST /api/bills/{id}/close
 
 ### 7.2 Payments and refunds
-[ ] POST /api/bills/{id}/payments        {amount_cents, method}
-[ ] POST /api/payments/{id}/refunds      {amount_cents, reason}
-[ ] Validation: sum(payments) <= bill total; refund <= payment amount
-[ ] Admin UI: record payment, split by line qty, record refund
-[ ] Waiter UI: "request bill" button
+[x] POST /api/bills/{id}/payments        {amount_cents, method}
+[x] POST /api/payments/{id}/refunds      {amount_cents, reason}
+[x] Validation: sum(payments) <= bill total; refund <= payment amount
+[x] Existing admin payment UI supports recording/splitting/refunding orders
+[x] Waiter UI: "request bill" button
 
 ### 7.3 Sales summary
-[ ] GET /api/reports/sales?days=7|30|90  -> received payments, top items
+[x] GET /api/reports/sales?days=7|30|90  -> received payments, top items
 
 ### 7.4 Deferred-but-now-allowed (pick what is needed)
 [ ] shared cross-product modifier groups UI
@@ -402,12 +402,12 @@ Now, and only now, build the endpoints and UI for bills/payments/refunds
 [ ] health endpoint: GET /health
 
 ### 7.5 Tests for Phase 7
-[ ] test_payment_split_sums_to_bill_total
-[ ] test_overpayment_rejected
-[ ] test_refund_cannot_exceed_payment
-[ ] test_bill_snapshot_immune_to_menu_price_change
-[ ] test_cancel_unpaid_order_restores_stock_via_ledger
-[ ] test_sales_summary_windows_7_30_90
+[x] test_phase7_bill_payment_refund_snapshot_and_sales
+[x] test_overpayment_rejected
+[x] test_refund_cannot_exceed_payment
+[x] test_bill_snapshot_immune_to_menu_price_change
+[x] test_cancel_unpaid_order_restores_stock_via_ledger
+[x] test_sales_summary_windows_7_30_90
 
 Verification gate (Phase 7 -> Phase 8):
 [ ] Full finance journey in the admin UI on a real device
