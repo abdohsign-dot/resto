@@ -1,0 +1,13 @@
+{
+  "restaurant_name": "Restaurant",
+  "currency": "MAD",
+  "admin_pin": "1234",
+  "printer_ip": "",
+  "printer_port": 9100,
+  "autoprint": true,
+  "port": 8080,
+  "disk_warning_mb": 500,
+  "log_retention_days": 90,
+  "ticket_amber_minutes": 5,
+  "ticket_red_minutes": 10
+}

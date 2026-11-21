@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/logs/
+data/tickets/
+data/item_images/
+data/restaurant.db
+config.json
+.venv/

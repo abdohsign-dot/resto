@@ -18,15 +18,18 @@ Features
 import hashlib
 import json
 import base64
+import argparse
 import datetime
 import math
 import os
 import re
+import signal
 import socket
 import sqlite3
 import threading
 import time
 import uuid
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -40,14 +43,20 @@ IMAGES_DIR = os.path.join(DATA_DIR, "item_images")
 APP_PATH = os.path.join(BASE, "app.html")
 
 DEFAULT_CONFIG = {
-    "restaurant_name": "My Restaurant",
+    "restaurant_name": "Restaurant",
     "currency": "MAD",
     "admin_pin": "1234",
-    "printer_ip": "",          # e.g. "192.168.1.50" (ESC/POS, port 9100). Empty = off.
+    "printer_ip": "",
     "printer_port": 9100,
     "autoprint": True,         # print ticket automatically when an order arrives
     "port": 8080,
+    "disk_warning_mb": 500,
+    "log_retention_days": 90,
+    "ticket_amber_minutes": 5,
+    "ticket_red_minutes": 10,
 }
+
+SCHEMA_VERSION = 1
 
 # ---------------------------------------------------------------- config / db
 
@@ -56,11 +65,18 @@ _audit_lock = threading.Lock()
 
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg.update(json.load(f))
-    except Exception:
-        pass
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception:
+            pass
+    else:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+        print("Generated config: %s" % CONFIG_PATH)
+        print("First-run admin PIN: %s" % cfg["admin_pin"])
     return cfg
 
 def save_config(cfg):
@@ -168,6 +184,13 @@ CREATE TABLE IF NOT EXISTS payment_allocations (
 
 def init_db():
     conn = db()
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    db_version = int(version_row[0])
+    if db_version > SCHEMA_VERSION:
+        conn.close()
+        raise RuntimeError(
+            "database was written by a newer version; upgrade the server or restore a backup"
+        )
     conn.executescript(SCHEMA)
     conn.execute("INSERT OR IGNORE INTO branches(id, name) VALUES(1, 'Main Branch')")
     migrations = {
@@ -201,6 +224,7 @@ def init_db():
     if row is None:
         conn.execute("INSERT INTO meta(key, value) VALUES('rev','1')")
         seed(conn)
+    conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
     conn.commit()
     conn.close()
 
@@ -558,7 +582,9 @@ def h_state(args, body, conn):
         "currency": CONFIG["currency"],
         "has_printer": bool((CONFIG.get("printer_ip") or "").strip()),
         "settings": {k: CONFIG.get(k) for k in
-                     ("restaurant_name", "currency", "printer_ip", "printer_port", "autoprint")},
+                     ("restaurant_name", "currency", "printer_ip", "printer_port", "autoprint",
+                      "disk_warning_mb", "log_retention_days",
+                      "ticket_amber_minutes", "ticket_red_minutes")},
         "branches": [dict(r) for r in conn.execute(
             "SELECT * FROM branches WHERE active=1 ORDER BY id")],
         "sections": [dict(r) for r in conn.execute(
@@ -687,7 +713,9 @@ def h_order_status(args, body, conn):
     if order["branch_id"] != branch_id:
         raise ApiError(404, "Order not found")
     if order["status"] == "served" and status != "served":
-        raise ApiError(400, "Order already served")
+        reason = str(body.get("reopen_reason") or "").strip()
+        if not reason:
+            raise ApiError(400, "A reopen reason is required")
     if status == "cancelled" and conn.execute(
             "SELECT 1 FROM payments WHERE order_id=? AND amount>refunded_amount LIMIT 1",
             (order_id,)).fetchone():
@@ -1010,12 +1038,23 @@ def h_reservation_create(args, body, conn):
         raise ApiError(400, "Reservation needs a guest name, future date, and party size from 1 to 50")
     if table_no is not None and table_no <= 0:
         raise ApiError(400, "Table must be a positive number")
+    conflict = None
+    if table_no is not None:
+        window = 7200
+        row = conn.execute(
+            "SELECT guest_name,starts_at FROM reservations "
+            "WHERE branch_id=? AND table_no=? AND status!='cancelled' "
+            "AND ABS(starts_at-?)<=? LIMIT 1",
+            (branch_id, table_no, starts_at, window)).fetchone()
+        if row:
+            conflict = "Table %d is already booked at %s" % (
+                table_no, datetime.datetime.fromtimestamp(row["starts_at"]).strftime("%H:%M"))
     cur = conn.execute(
         "INSERT INTO reservations(branch_id,guest_name,contact,starts_at,party_size,table_no,status,note,created_at) "
         "VALUES(?,?,?,?,?,?,'booked',?,?)",
         (branch_id, name, contact, starts_at, party_size, table_no, note, time.time()))
     bump_rev(conn); conn.commit()
-    return {"ok": True, "reservation_id": cur.lastrowid}
+    return {"ok": True, "reservation_id": cur.lastrowid, "warning": conflict}
 
 def h_reservation_update(args, body, conn):
     branch_id = get_branch_id(body)
@@ -1075,6 +1114,16 @@ def h_payment_create(args, body, conn):
     allocations = body.get("allocations") or []
     if not isinstance(allocations, list):
         raise ApiError(400, "Invalid bill split")
+    if allocations:
+        allocated_qty = 0
+        for allocation in allocations:
+            try:
+                qty = float(allocation["qty"])
+            except (KeyError, TypeError, ValueError):
+                raise ApiError(400, "Invalid bill split allocation")
+            if not math.isfinite(qty) or not qty.is_integer() or qty <= 0:
+                raise ApiError(400, "Split quantities must be whole numbers")
+            allocated_qty += int(qty)
     cur = conn.execute(
         "INSERT INTO payments(order_id,amount,method,note,created_at) VALUES(?,?,?,?,?)",
         (order_id, amount, method, str(body.get("note") or "")[:200], time.time()))
@@ -1186,7 +1235,7 @@ def h_item_image(args, body, conn):
     if not valid_signature:
         raise ApiError(400, "Image content does not match its format")
     os.makedirs(IMAGES_DIR, exist_ok=True)
-    filename = "%d.%s" % (item_id, extension)
+    filename = "%s.%s" % (uuid.uuid4().hex, extension)
     path = os.path.join(IMAGES_DIR, filename)
     with open(path, "wb") as image_file:
         image_file.write(image)
@@ -1198,7 +1247,8 @@ def h_item_image(args, body, conn):
 
 def h_settings(args, body, conn):
     global CONFIG
-    allowed = ("restaurant_name", "currency", "printer_ip", "printer_port", "autoprint", "admin_pin", "port")
+    allowed = ("restaurant_name", "currency", "printer_ip", "printer_port", "autoprint", "admin_pin", "port",
+               "disk_warning_mb", "log_retention_days", "ticket_amber_minutes", "ticket_red_minutes")
     for k in allowed:
         if k in body:
             v = body[k]
@@ -1422,7 +1472,29 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/events":
             self.h_events()
             return
-        image_match = re.fullmatch(r"/item-images/([1-9]\d*)\.(png|jpg|webp)", p)
+        if p == "/health":
+            conn = db()
+            try:
+                conn.execute("PRAGMA user_version").fetchone()
+                db_writable = True
+                conn.execute("BEGIN IMMEDIATE")
+                conn.rollback()
+                open_tickets = conn.execute(
+                    "SELECT COUNT(*) c FROM orders WHERE status IN ('sent','preparing','ready')"
+                ).fetchone()["c"]
+            except sqlite3.Error:
+                db_writable = False
+                open_tickets = 0
+            finally:
+                conn.close()
+            self._json({
+                "status": "ok",
+                "schema_version": SCHEMA_VERSION,
+                "open_tickets": open_tickets,
+                "db_writable": db_writable,
+            })
+            return
+        image_match = re.fullmatch(r"/item-images/([a-fA-F0-9]{32})\.(png|jpg|webp)", p)
         if image_match:
             path = os.path.join(IMAGES_DIR, image_match.group(0).split("/")[-1])
             if not os.path.isfile(path):
@@ -1469,19 +1541,13 @@ class Handler(BaseHTTPRequestHandler):
                               "period": (query or {}).get("period", ["7d"])[0]})
                 body["branch_id"] = self.headers.get("X-Branch-ID") or (
                     (query or {}).get("branch_id", [body.get("branch_id", 1)])[0])
-                # Log the submitted field names, plus a strict allowlist of low-risk
-                # values. Never copy free text, personal details, credentials,
-                # payment amounts, or uploaded image data into the audit log.
+                # Audit field names and low-risk allowlisted values only.
                 self._audit_fields = sorted(k for k in body if k != "branch_id")
                 safe_values = {"price", "qty", "status", "table_no", "party_size",
                                "active", "position", "stock_qty", "section_id",
                                "copy_menu", "lang", "period"}
                 self._audit_summary = {k: body[k] for k in self._audit_fields
                                        if k in safe_values and isinstance(body[k], (str, int, float, bool, type(None)))}
-                if any(token in urlparse(self.path).path for token in ("/sections", "/items", "/branches")):
-                    for key in ("name", "kitchen_station"):
-                        if isinstance(body.get(key), str):
-                            self._audit_summary[key] = body[key][:100]
                 if needs_admin:
                     check_admin(self.headers)
                 conn = db()
@@ -1512,8 +1578,96 @@ def lan_ip():
     except Exception:
         return "127.0.0.1"
 
+def directory_size_mb(path):
+    total = 0
+    if not os.path.isdir(path):
+        return 0
+    for root, dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total / (1024 * 1024)
+
+def cleanup_old_logs(days):
+    cutoff = time.time() - max(0, int(days)) * 86400
+    removed = 0
+    if os.path.isdir(AUDIT_DIR):
+        for name in os.listdir(AUDIT_DIR):
+            path = os.path.join(AUDIT_DIR, name)
+            if os.path.isfile(path):
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        os.unlink(path)
+                        removed += 1
+                except OSError:
+                    pass
+    print("Cleaned %d log file(s) older than %d days." % (removed, days))
+
+def create_backup(destination):
+    target = os.path.abspath(destination)
+    if os.path.isdir(target):
+        target = os.path.join(target, "restaurant-backup-%s.zip" %
+                              datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    temp_db = os.path.join(os.path.dirname(target), ".restaurant-backup.db")
+    source = sqlite3.connect(DB_PATH, timeout=15)
+    try:
+        backup = sqlite3.connect(temp_db)
+        source.backup(backup)
+        backup.close()
+    finally:
+        source.close()
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(temp_db, "data/restaurant.db")
+        for source_dir, archive_dir in ((TICKETS_DIR, "data/tickets"),
+                                        (IMAGES_DIR, "data/item_images"),
+                                        (AUDIT_DIR, "data/logs")):
+            if os.path.isdir(source_dir):
+                for root, dirs, files in os.walk(source_dir):
+                    for name in files:
+                        path = os.path.join(root, name)
+                        relative = os.path.relpath(path, DATA_DIR)
+                        archive.write(path, relative.replace(os.sep, "/"))
+        if os.path.isfile(CONFIG_PATH):
+            archive.write(CONFIG_PATH, "config.json")
+    try:
+        os.unlink(temp_db)
+    except OSError:
+        pass
+    print("Backup created: %s" % target)
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backup", metavar="PATH",
+                        help="Create a timestamped backup archive and exit")
+    parser.add_argument("--cleanup-logs", metavar="N", type=int,
+                        help="Delete log files older than N days")
+    args = parser.parse_args()
     init_db()
+    if args.backup:
+        create_backup(args.backup)
+        raise SystemExit(0)
+    if args.cleanup_logs is not None:
+        cleanup_old_logs(args.cleanup_logs)
+        raise SystemExit(0)
+    warning_mb = float(CONFIG.get("disk_warning_mb", 500))
+    for label, path in (("item images", IMAGES_DIR), ("audit logs", AUDIT_DIR)):
+        used = directory_size_mb(path)
+        if used > warning_mb:
+            print("WARNING: %s directory exceeds %.0f MB (currently %.1f MB): %s" %
+                  (label, warning_mb, used, path))
+    conn = db()
+    try:
+        open_counts = conn.execute(
+            "SELECT SUM(status='sent'), SUM(status='preparing'), SUM(status='ready') "
+            "FROM orders").fetchone()
+        sent, preparing, ready = open_counts
+        open_total = sum(v or 0 for v in open_counts)
+        print("%d open tickets, %d ready to serve." % (open_total, ready or 0))
+    finally:
+        conn.close()
     port = int(os.environ.get("PORT") or CONFIG.get("port") or 8080)
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print("Restaurant ordering server running")
@@ -1523,7 +1677,14 @@ if __name__ == "__main__":
     print("  Admin PIN       : %s  (config.json)" % CONFIG["admin_pin"])
     print("  Printer         : %s" % ((CONFIG.get("printer_ip") or "not configured") +
                                    (":%s" % CONFIG.get("printer_port") if CONFIG.get("printer_ip") else "")))
+    def stop_server(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, stop_server)
+    signal.signal(signal.SIGTERM, stop_server)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("Stopped.")
+    finally:
+        server.shutdown()
+        server.server_close()

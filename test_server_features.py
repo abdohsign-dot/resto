@@ -18,6 +18,7 @@ class RestaurantFeatureTests(unittest.TestCase):
         server.DB_PATH = os.path.join(self.temp.name, "restaurant.db")
         server.TICKETS_DIR = os.path.join(self.temp.name, "tickets")
         server.IMAGES_DIR = os.path.join(self.temp.name, "item_images")
+        server.AUDIT_DIR = os.path.join(self.temp.name, "logs")
         server.CONFIG = dict(server.DEFAULT_CONFIG)
         server.init_db()
         self.conn = server.db()
@@ -56,6 +57,15 @@ class RestaurantFeatureTests(unittest.TestCase):
         finally:
             server.DATA_DIR, server.DB_PATH, server.TICKETS_DIR, server.IMAGES_DIR = original
             legacy.cleanup()
+
+    def test_newer_database_schema_is_refused(self):
+        conn = self.conn
+        conn.execute("PRAGMA user_version=999")
+        conn.commit()
+        conn.close()
+        with self.assertRaisesRegex(RuntimeError, "newer version"):
+            server.init_db()
+        self.conn = server.db()
 
     def test_branch_copy_is_isolated(self):
         source = server.h_state([], {"branch_id": 1}, self.conn)
@@ -130,8 +140,98 @@ class RestaurantFeatureTests(unittest.TestCase):
         uploaded = server.h_item_image([str(item_id)], {
             "branch_id": 1, "mime": "image/png", "data": image,
         }, self.conn)
-        self.assertTrue(os.path.isfile(os.path.join(server.IMAGES_DIR, "%d.png" % item_id)))
-        self.assertEqual(uploaded["image_url"], "/item-images/%d.png" % item_id)
+        filename = os.path.basename(uploaded["image_url"])
+        self.assertRegex(filename, r"[0-9a-f]{32}\.png")
+        self.assertTrue(os.path.isfile(os.path.join(server.IMAGES_DIR, filename)))
+
+        with self.assertRaises(server.ApiError) as error:
+            server.h_item_image([str(item_id)], {
+                "branch_id": 1, "mime": "image/png",
+                "data": base64.b64encode(b"\x89PNG" + b"x" * 3_000_000).decode("ascii"),
+            }, self.conn)
+        self.assertEqual(error.exception.code, 413)
+
+    def test_negative_cross_branch_resource_access(self):
+        branch = server.h_branch_create([], {"branch_id": 1, "name": "Branch B"}, self.conn)
+        branch_id = branch["branch_id"]
+
+        item = self.conn.execute("SELECT id FROM items WHERE branch_id=1 LIMIT 1").fetchone()
+        staff = self.conn.execute("SELECT id FROM staff WHERE branch_id=1 LIMIT 1").fetchone()
+        order = server.h_order_create([], {
+            "branch_id": 1, "table_no": 1, "client_uuid": "cross-order",
+            "lines": [{"item_id": item["id"], "qty": 1}],
+        }, self.conn)
+        reservation = server.h_reservation_create([], {
+            "branch_id": 1, "guest_name": "Private Guest",
+            "starts_at": server.time.time() + 7200, "party_size": 2,
+        }, self.conn)
+
+        calls = [
+            lambda: server.h_order_status([str(order["order_id"])],
+                                          {"branch_id": branch_id, "status": "ready"}, self.conn),
+            lambda: server.h_item_update([str(item["id"])],
+                                         {"branch_id": branch_id, "name": "Leak"}, self.conn),
+            lambda: server.h_staff_update([str(staff["id"])],
+                                          {"branch_id": branch_id, "name": "Leak"}, self.conn),
+            lambda: server.h_reservation_update([str(reservation["reservation_id"])],
+                                                {"branch_id": branch_id, "status": "seated"}, self.conn),
+            lambda: server.h_sales([], {"branch_id": branch_id, "period": "7d"}, self.conn),
+        ]
+        # Sales is branch-valid and must return Branch B data, not Branch A data.
+        for call in calls[:4]:
+            with self.assertRaises(server.ApiError) as error:
+                call()
+            self.assertIn(error.exception.code, (403, 404))
+        branch_sales = calls[4]()
+        self.assertEqual(branch_sales["daily"], [])
+
+    def test_payment_split_cannot_over_allocate(self):
+        item = self.conn.execute("SELECT id,price FROM items ORDER BY id LIMIT 1").fetchone()
+        server.h_item_update([str(item["id"])], {"branch_id": 1, "price": 6}, self.conn)
+        order = server.h_order_create([], {
+            "branch_id": 1, "table_no": 2, "client_uuid": "split-order",
+            "lines": [{"item_id": item["id"], "qty": 2}],
+        }, self.conn)
+        loaded = server.get_order(self.conn, order["order_id"])
+        line = loaded["lines"][0]
+        with self.assertRaises(server.ApiError) as error:
+            server.h_payment_create([str(order["order_id"])], {
+                "branch_id": 1, "amount": 10, "method": "cash",
+                "allocations": [{"line_id": line["id"], "qty": 2}],
+            }, self.conn)
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn("match", error.exception.msg)
+
+    def test_audit_log_allowlist_excludes_guest_name(self):
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        base_url = "http://127.0.0.1:%d" % httpd.server_address[1]
+        server.AUDIT_DIR = os.path.join(self.temp.name, "logs")
+        try:
+            payload = json.dumps({
+                "branch_id": 1, "guest_name": "Sensitive Audit Guest",
+                "contact": "555-SECRET", "starts_at": server.time.time() + 3600,
+                "party_size": 4, "table_no": 7,
+            }).encode()
+            request = urllib.request.Request(
+                base_url + "/api/reservations", data=payload, method="POST",
+                headers={"Content-Type": "application/json", "X-Branch-ID": "1",
+                         "X-Admin-Pin": server.CONFIG["admin_pin"]})
+            with urllib.request.urlopen(request) as response:
+                json.load(response)
+            log_files = [os.path.join(server.AUDIT_DIR, name)
+                         for name in os.listdir(server.AUDIT_DIR)
+                         if name.endswith(".jsonl")]
+            self.assertTrue(log_files)
+            with open(log_files[-1], "r", encoding="utf-8") as log:
+                content = log.read()
+            self.assertNotIn("Sensitive Audit Guest", content)
+            self.assertNotIn("555-SECRET", content)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join()
 
     def test_http_routes_enforce_admin_and_branch_headers(self):
         httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)

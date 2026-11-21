@@ -16,6 +16,9 @@ or `app.css`, rebuild the single-page app:
 python3 build_app.py
 ```
 
+Use `python3 build_app.py --check` in CI. The build reads `top.html`, `mid.html`,
+`app.css`, `app1.js`, `app2.js`, and `app3.js`; never edit `app.html` directly.
+
 ## Admin features
 
 - **Branches:** create a branch from Administration. Optionally copy the current menu

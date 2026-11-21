@@ -27,7 +27,14 @@ function ageLabel(ts) {
   if (S.lang === 'ar') return m < 60 ? m + ' د' : h + ' س ' + r + ' د';
   return m < 60 ? m + 'm' : h + 'h' + r + 'm';
 }
-function ageClass(ts) { var m = ageMin(ts); return m >= 15 ? 'late' : (m >= 8 ? 'warn' : ''); }
+function ageClass(ts) {
+  var m = ageMin(ts);
+  var amber = Number(S.data && S.data.settings && S.data.settings.ticket_amber_minutes != null
+    ? S.data.settings.ticket_amber_minutes : 5);
+  var red = Number(S.data && S.data.settings && S.data.settings.ticket_red_minutes != null
+    ? S.data.settings.ticket_red_minutes : 10);
+  return m >= red ? 'late' : (m >= amber ? 'warn' : '');
+}
 function uuid() {
   if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
   return 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2);
@@ -537,11 +544,16 @@ function renderConn() {
   var bar = $('#connbar');
   if (!S.online || S.queue.length) {
     bar.classList.remove('hidden');
-    bar.textContent = S.queue.length
-      ? ('⚠ ' + S.queue.length + ' ' + tr('waitOnline'))
-      : '⚠ ' + tr('offline');
+    if (S.queue.length) {
+      var noun = S.queue.length === 1 ? 'order/action waiting to send' : 'orders/actions waiting to send';
+      bar.innerHTML = '⚠ ' + S.queue.length + ' ' + noun +
+        ' <button class="btn small" onclick="retryQueued()">Retry now</button>';
+    } else {
+      bar.textContent = '⚠ ' + tr('offline');
+    }
   } else bar.classList.add('hidden');
 }
+function retryQueued() { flushQueue(); }
 function connDot() { return '<span class="dot ' + (S.online ? '' : 'off') + '" title="' + tr('statusConnection') + '"></span>'; }
 
 // ---------- render dispatcher ----------

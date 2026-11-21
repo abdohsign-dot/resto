@@ -126,16 +126,16 @@ function ticketCard(o, actions) {
       (l.note ? ' <span class="lnote">— ' + esc(l.note) + '</span>' : '') + '</span>' +
       '<span class="dim">' + (l.status === 'cancelled' ? tr('cancelled') : money(l.price * l.qty)) + '</span></div>';
   }).join('');
-  var acts = '';
+  var acts = '<div class="tacts"><button class="btn small" onclick="printTicket(' + o.id + ')">🖨️ ' +
+    tr('print') + '</button>';
   if (actions) {
-    acts = '<div class="tacts">' +
-      '<button class="btn small" onclick="printTicket(' + o.id + ')">🖨️ ' + tr('print') + '</button>' +
+    acts +=
       (!o.bill_requested && o.status !== 'cancelled'
         ? '<button class="btn small" onclick="requestBill(' + o.id + ')">' + tr('requestBill') + '</button>' : '') +
       (o.status === 'ready' ? '<button class="btn small green" onclick="serveOrder(' + o.id + ')">✓ ' + tr('served') + '</button>' : '') +
       '<button class="btn small danger" onclick="cancelOrderDlg(' + o.id + ')">✕ ' + tr('cancel') + '</button>' +
-      '</div>';
   }
+  acts += '</div>';
   return '<div class="ticket st-' + o.status + '">' +
     '<div class="thead"><span class="tid">' + tr('ticket') + ' #' + o.id + ' · ' + hhmm(o.created_at) + '</span>' +
     '<span class="chip ' + o.status + '">' + tStatus(o.status) + '</span></div>' +
