@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS order_items (
     item_id INTEGER,
     name TEXT NOT NULL,
     price REAL NOT NULL,
+    unit_price_cents INTEGER,
     qty INTEGER NOT NULL DEFAULT 1,
     note TEXT DEFAULT '',
     status TEXT DEFAULT 'sent',
@@ -177,24 +178,6 @@ CREATE TABLE IF NOT EXISTS product_variants (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_default_variant
     ON product_variants(product_id) WHERE is_default=1;
-CREATE TRIGGER IF NOT EXISTS tr_variant_default_insert
-AFTER INSERT ON product_variants
-BEGIN
-    SELECT CASE WHEN
-        (SELECT COUNT(*) FROM product_variants
-         WHERE product_id=NEW.product_id AND is_default=1) != 1
-    THEN RAISE(ABORT, 'product requires exactly one default variant')
-    END;
-END;
-CREATE TRIGGER IF NOT EXISTS tr_variant_default_update
-AFTER UPDATE OF is_default ON product_variants
-BEGIN
-    SELECT CASE WHEN
-        (SELECT COUNT(*) FROM product_variants
-         WHERE product_id=NEW.product_id AND is_default=1) != 1
-    THEN RAISE(ABORT, 'product requires exactly one default variant')
-    END;
-END;
 CREATE INDEX IF NOT EXISTS ix_products_section
     ON products(section_id) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS ix_variants_product
@@ -312,7 +295,8 @@ def init_db():
                         "stock_debited": "INTEGER NOT NULL DEFAULT 0",
                         "variant_id": "INTEGER",
                         "variant_name": "TEXT",
-                        "modifiers_json": "TEXT"},
+                        "modifiers_json": "TEXT",
+                        "unit_price_cents": "INTEGER"},
         "payments": {"refunded_amount": "REAL NOT NULL DEFAULT 0"},
     }
     for table, columns in migrations.items():
@@ -327,7 +311,14 @@ def init_db():
         conn.execute("INSERT INTO meta(key, value) VALUES('rev','1')")
         seed(conn)
     if db_version < SCHEMA_VERSION:
-        migrate_catalog_v2(conn)
+        try:
+            conn.commit()
+            conn.execute("BEGIN")
+            migrate_catalog_v2(conn)
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
     conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
     conn.commit()
     conn.close()
@@ -867,6 +858,150 @@ def h_staff_auth(args, body, conn):
         "kitchen_station": row["kitchen_station"] if "kitchen_station" in row.keys() else "",
     }
 
+def h_catalog_order_create(body, conn, branch_id):
+    table_no = body.get("table_no")
+    if isinstance(table_no, bool) or not isinstance(table_no, int) or table_no <= 0:
+        raise ApiError(400, "table_no must be a positive integer")
+    lines = body.get("lines") or []
+    if not isinstance(lines, list) or not lines:
+        raise ApiError(400, "Order has no items")
+    uuid = str(body.get("client_uuid") or "")
+    if uuid:
+        existing = conn.execute("SELECT id,branch_id FROM orders WHERE uuid=?", (uuid,)).fetchone()
+        if existing:
+            if existing["branch_id"] != branch_id:
+                raise ApiError(409, "Client order ID is already used by another branch")
+            return {"ok": True, "order_id": existing["id"], "duplicate": True}
+    staff_id = body.get("staff_id")
+    staff_name = ""
+    if staff_id:
+        staff = conn.execute("SELECT name FROM staff WHERE id=? AND branch_id=?",
+                             (staff_id, branch_id)).fetchone()
+        if not staff:
+            raise ApiError(400, "Waiter does not belong to this branch")
+        staff_name = staff["name"]
+    now = time.time()
+    order = conn.execute(
+        "INSERT INTO orders(uuid,table_no,staff_id,staff_name,note,status,created_at,"
+        "updated_at,branch_id,lang) VALUES(?,?,?,?,?, 'sent',?,?,?,?)",
+        (uuid or None, table_no, staff_id, staff_name,
+         str(body.get("note") or "")[:300], now, now, branch_id,
+         body.get("lang") if body.get("lang") in ("fr", "ar", "en") else "fr"))
+    order_id = order.lastrowid
+    try:
+        for line in lines:
+            if not isinstance(line, dict):
+                conn.rollback()
+                raise ApiError(400, "Invalid order line")
+            try:
+                qty = int(line.get("qty", 1))
+                if qty != line.get("qty", 1):
+                    raise ValueError()
+            except (TypeError, ValueError):
+                conn.rollback()
+                raise ApiError(400, "Invalid item quantity")
+            if qty < 1 or qty > 50:
+                conn.rollback()
+                raise ApiError(400, "Item quantity must be between 1 and 50")
+            product_id = int(line["product_id"])
+            variant_id = int(line["variant_id"])
+            product = require_product(conn, product_id, branch_id)
+            variant = require_variant(conn, variant_id, product_id, branch_id)
+            if not variant["active"]:
+                conn.rollback()
+                raise ApiError(409, "Variant is inactive")
+            if variant["stock_qty"] is not None:
+                updated = conn.execute(
+                    "UPDATE product_variants SET stock_qty=stock_qty-? "
+                    "WHERE id=? AND stock_qty IS NOT NULL AND stock_qty>=?",
+                    (qty, variant_id, qty))
+                if updated.rowcount != 1:
+                    conn.rollback()
+                    raise ApiError(409, "%s is out of stock" % product["name"])
+            selected_ids = line.get("modifier_option_ids") or []
+            if not isinstance(selected_ids, list):
+                conn.rollback()
+                raise ApiError(400, "Invalid selected modifiers")
+            if len(selected_ids) != len(set(selected_ids)):
+                conn.rollback()
+                raise ApiError(400, "Duplicate modifier option")
+            effective = {}
+            for attachment in conn.execute(
+                    "SELECT pmg.*,g.selection_type,g.min_select,g.max_select "
+                    "FROM product_modifier_groups pmg "
+                    "JOIN modifier_groups g ON g.id=pmg.modifier_group_id "
+                    "WHERE pmg.product_id=?", (product_id,)):
+                minimum = attachment["override_min"] if attachment["override_min"] is not None else attachment["min_select"]
+                maximum = attachment["override_max"] if attachment["override_max"] is not None else attachment["max_select"]
+                effective[attachment["modifier_group_id"]] = {
+                    "name": attachment["name"] if "name" in attachment.keys() else "",
+                    "minimum": minimum,
+                    "maximum": maximum,
+                }
+            actual_modifiers = []
+            selected_by_group = {}
+            attached_group_ids = set(effective)
+            for raw_id in selected_ids:
+                option = conn.execute(
+                    "SELECT o.*,g.branch_id,g.name group_name "
+                    "FROM modifier_options o "
+                    "JOIN modifier_groups g ON g.id=o.modifier_group_id "
+                    "WHERE o.id=? AND o.active=1", (int(raw_id),)).fetchone()
+                if not option or option["branch_id"] != branch_id:
+                    conn.rollback()
+                    raise ApiError(400, "Unknown modifier option")
+                if option["modifier_group_id"] not in attached_group_ids:
+                    conn.rollback()
+                    raise ApiError(400, "Modifier option does not belong to this product")
+                selected_by_group.setdefault(option["modifier_group_id"], 0)
+                selected_by_group[option["modifier_group_id"]] += 1
+                actual_modifiers.append({
+                    "id": option["id"],
+                    "name": option["name"],
+                    "delta": option["price_delta_cents"],
+                })
+            for group_id, bounds in effective.items():
+                selected_count = selected_by_group.get(group_id, 0)
+                if selected_count < bounds["minimum"]:
+                    conn.rollback()
+                    raise ApiError(400, "Required modifier selection missing")
+                if selected_count > bounds["maximum"]:
+                    conn.rollback()
+                    raise ApiError(400, "Modifier selection exceeds maximum")
+            unit_price_cents = variant["price_cents"] + sum(
+                modifier["delta"] for modifier in actual_modifiers)
+            if unit_price_cents < 0:
+                conn.rollback()
+                raise ApiError(400, "Unit price cannot be negative")
+            line_row = conn.execute(
+                "INSERT INTO order_items"
+                "(order_id,item_id,name,price,qty,note,status,modifiers,"
+                "stock_debited,variant_id,variant_name,modifiers_json,unit_price_cents)"
+                " VALUES(?,?,?,?,?,?, 'sent',?,?,?,?,?,?)",
+                (order_id, None, product["name"], unit_price_cents / 100.0, qty,
+                 str(line.get("note") or "")[:200],
+                 json.dumps(actual_modifiers, ensure_ascii=False),
+                 int(variant["stock_qty"] is not None),
+                 variant_id, variant["name"],
+                 json.dumps(actual_modifiers, ensure_ascii=False),
+                 unit_price_cents))
+            if variant["stock_qty"] is not None:
+                conn.execute(
+                    "INSERT INTO stock_movements"
+                    "(variant_id,order_item_id,delta,reason,created_at,actor)"
+                    " VALUES(?,?,?,'order_accept',?,?)",
+                    (variant_id, line_row.lastrowid, -qty, now, "system"))
+        bump_rev(conn)
+        conn.commit()
+    except ApiError:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    maybe_autoprint(order_id)
+    return {"ok": True, "order_id": order_id}
+
 def h_order_create(args, body, conn):
     branch_id = get_branch_id(body)
     require_branch(conn, branch_id)
@@ -876,6 +1011,10 @@ def h_order_create(args, body, conn):
     lines = body.get("lines") or []
     if not lines:
         raise ApiError(400, "Order has no items")
+    if any(isinstance(line, dict) and "product_id" in line for line in lines):
+        if not all(isinstance(line, dict) and "product_id" in line for line in lines):
+            raise ApiError(400, "Mixed legacy and catalog order lines are not supported")
+        return h_catalog_order_create(body, conn, branch_id)
     # idempotency: same client_uuid returns the already-created order
     uuid = str(body.get("client_uuid") or "")
     if uuid:
@@ -1071,6 +1210,9 @@ def h_section_update(args, body, conn):
     if "kitchen_station" in body:
         conn.execute("UPDATE sections SET kitchen_station=? WHERE id=? AND branch_id=?",
                      (str(body["kitchen_station"] or "").strip()[:100], sid, branch_id))
+    if "sort_order" in body:
+        conn.execute("UPDATE sections SET position=? WHERE id=? AND branch_id=?",
+                     (int(body["sort_order"]), sid, branch_id))
     for k in ("position", "active"):
         if k in body:
             conn.execute("UPDATE sections SET %s=? WHERE id=? AND branch_id=?" % k,
@@ -1085,6 +1227,9 @@ def h_section_delete(args, body, conn):
         raise ApiError(404, "Section not found")
     n = conn.execute("SELECT COUNT(*) c FROM items WHERE section_id=? AND branch_id=?",
                      (sid, branch_id)).fetchone()["c"]
+    n += conn.execute(
+        "SELECT COUNT(*) c FROM products WHERE section_id=? AND deleted_at IS NULL",
+        (sid,)).fetchone()["c"]
     if n:
         raise ApiError(400, "Section still has %d item(s) — move or delete them first" % n)
     conn.execute("DELETE FROM sections WHERE id=? AND branch_id=?", (sid, branch_id))
@@ -1131,6 +1276,685 @@ def sync_catalog_from_item(conn, item_id):
         " VALUES(?,?,?)",
         (item_id, product_id, variant.lastrowid))
 
+def parse_cents(value):
+    try:
+        if isinstance(value, bool):
+            raise ValueError()
+        cents = int(value)
+        if cents != value:
+            raise ValueError()
+    except (TypeError, ValueError, OverflowError):
+        raise ApiError(400, "Price must be an integer number of cents")
+    if cents < 0:
+        raise ApiError(400, "Price cannot be negative")
+    return cents
+
+def parse_stock(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ApiError(400, "Stock must be a non-negative integer or null")
+    try:
+        stock = int(value)
+        if stock != value:
+            raise ValueError()
+    except (TypeError, ValueError, OverflowError):
+        raise ApiError(400, "Stock must be a non-negative integer or null")
+    if stock < 0:
+        raise ApiError(400, "Stock cannot be negative")
+    return stock
+
+def require_product(conn, product_id, branch_id):
+    row = conn.execute(
+        "SELECT p.* FROM products p JOIN sections s ON s.id=p.section_id "
+        "WHERE p.id=? AND s.branch_id=? AND p.deleted_at IS NULL",
+        (product_id, branch_id)).fetchone()
+    if not row:
+        raise ApiError(404, "Product not found")
+    return row
+
+def require_variant(conn, variant_id, product_id, branch_id):
+    row = conn.execute(
+        "SELECT v.* FROM product_variants v "
+        "JOIN products p ON p.id=v.product_id "
+        "JOIN sections s ON s.id=p.section_id "
+        "WHERE v.id=? AND v.product_id=? AND s.branch_id=?",
+        (variant_id, product_id, branch_id)).fetchone()
+    if not row:
+        raise ApiError(404, "Variant not found")
+    return row
+
+def validate_variants(conn, product_id, variants):
+    if not isinstance(variants, list) or not variants:
+        raise ApiError(400, "Product requires at least one variant")
+    active_count = sum(1 for v in variants if v.get("active", 1) in (1, True))
+    if active_count < 1:
+        raise ApiError(400, "Product requires at least one active variant")
+    default_count = sum(1 for v in variants if v.get("is_default", 0) in (1, True))
+    if default_count != 1:
+        raise ApiError(400, "Product requires exactly one default variant")
+    names = set()
+    normalized = []
+    for variant in variants:
+        if not isinstance(variant, dict):
+            raise ApiError(400, "Invalid variant")
+        name = str(variant.get("name") or "").strip()[:80]
+        if not name:
+            raise ApiError(400, "Variant name required")
+        if name in names:
+            raise ApiError(400, "Duplicate variant name")
+        names.add(name)
+        normalized.append({
+            "id": variant.get("id"),
+            "name": name,
+            "price_cents": parse_cents(variant.get("price_cents", 0)),
+            "stock_qty": parse_stock(variant.get("stock_qty")),
+            "is_default": int(bool(variant.get("is_default", 0))),
+            "sort_order": int(variant.get("sort_order", 0)),
+            "active": int(bool(variant.get("active", 1))),
+        })
+    return normalized
+
+def h_catalog_sections(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    return {"sections": [dict(r) for r in conn.execute(
+        "SELECT * FROM sections WHERE branch_id=? "
+        "ORDER BY position,id", (branch_id,))]}
+
+def h_catalog_products_list(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    section_id = body.get("section_id")
+    query = str(body.get("q") or "").strip().lower()
+    sql = ("SELECT p.* FROM products p JOIN sections s ON s.id=p.section_id "
+           "WHERE s.branch_id=? AND p.deleted_at IS NULL")
+    params = [branch_id]
+    if section_id:
+        sql += " AND p.section_id=?"
+        params.append(int(section_id))
+    sql += " ORDER BY p.sort_order,p.id"
+    out = []
+    for row in conn.execute(sql, params):
+        product = dict(row)
+        if query and query not in product["name"].lower():
+            continue
+        variants = [dict(v) for v in conn.execute(
+            "SELECT * FROM product_variants WHERE product_id=? "
+            "ORDER BY sort_order,id", (product["id"],))]
+        product["variants"] = variants
+        out.append(product)
+    return {"products": out}
+
+def h_catalog_product_create(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    section_id = int(body.get("section_id") or 0)
+    if not conn.execute("SELECT 1 FROM sections WHERE id=? AND branch_id=?",
+                        (section_id, branch_id)).fetchone():
+        raise ApiError(400, "Bad section")
+    name = str(body.get("name") or "").strip()[:120]
+    if not name:
+        raise ApiError(400, "Product name required")
+    variants = validate_variants(conn, None, body.get("variants"))
+    try:
+        conn.execute("BEGIN")
+        cur = conn.execute(
+            "INSERT INTO products(section_id,name,description,image_path,active,sort_order)"
+            " VALUES(?,?,?,?,?,?)",
+            (section_id, name, str(body.get("description") or "")[:300],
+             str(body.get("image_path") or "")[:500],
+             int(bool(body.get("active", 1))),
+             int(body.get("sort_order", 0))))
+        product_id = cur.lastrowid
+        for variant in variants:
+            conn.execute(
+                "INSERT INTO product_variants"
+                "(product_id,name,price_cents,stock_qty,is_default,sort_order,active)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (product_id, variant["name"], variant["price_cents"],
+                 variant["stock_qty"], variant["is_default"],
+                 variant["sort_order"], variant["active"]))
+        attachments = body.get("modifier_groups") or []
+        if not isinstance(attachments, list):
+            raise ApiError(400, "Invalid modifier groups")
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                raise ApiError(400, "Invalid modifier group attachment")
+            group_id = int(attachment["modifier_group_id"])
+            group = conn.execute(
+                "SELECT * FROM modifier_groups WHERE id=? AND branch_id=?",
+                (group_id, branch_id)).fetchone()
+            if not group:
+                raise ApiError(404, "Modifier group not found")
+            override_min = attachment.get("override_min")
+            override_max = attachment.get("override_max")
+            if override_min is not None:
+                override_min = int(override_min)
+            if override_max is not None:
+                override_max = int(override_max)
+            min_select = override_min if override_min is not None else group["min_select"]
+            max_select = override_max if override_max is not None else group["max_select"]
+            if min_select < 0 or max_select < min_select:
+                raise ApiError(400, "Invalid modifier group bounds")
+            conn.execute(
+                "INSERT INTO product_modifier_groups"
+                "(product_id,modifier_group_id,sort_order,override_min,override_max)"
+                " VALUES(?,?,?,?,?)",
+                (product_id, group_id, int(attachment.get("sort_order", 0)),
+                 override_min, override_max))
+        bump_rev(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"ok": True, "product_id": product_id}
+
+def h_catalog_product_update(args, body, conn):
+    branch_id = get_branch_id(body)
+    product_id = int(args[0])
+    require_product(conn, product_id, branch_id)
+    try:
+        conn.execute("BEGIN")
+        if "section_id" in body:
+            section_id = int(body["section_id"])
+            if not conn.execute("SELECT 1 FROM sections WHERE id=? AND branch_id=?",
+                                (section_id, branch_id)).fetchone():
+                raise ApiError(400, "Bad section")
+            conn.execute("UPDATE products SET section_id=? WHERE id=?",
+                         (section_id, product_id))
+        if "name" in body:
+            name = str(body["name"] or "").strip()[:120]
+            if not name:
+                raise ApiError(400, "Product name required")
+            conn.execute("UPDATE products SET name=? WHERE id=?", (name, product_id))
+        if "description" in body:
+            conn.execute("UPDATE products SET description=? WHERE id=?",
+                         (str(body["description"] or "")[:300], product_id))
+        if "image_path" in body:
+            conn.execute("UPDATE products SET image_path=? WHERE id=?",
+                         (str(body["image_path"] or "")[:500], product_id))
+        if "active" in body:
+            conn.execute("UPDATE products SET active=? WHERE id=?",
+                         (int(bool(body["active"])), product_id))
+        if "sort_order" in body:
+            conn.execute("UPDATE products SET sort_order=? WHERE id=?",
+                         (int(body["sort_order"]), product_id))
+        if "variants" in body:
+            variants = validate_variants(conn, product_id, body["variants"])
+            existing_ids = {r["id"] for r in conn.execute(
+                "SELECT id FROM product_variants WHERE product_id=?",
+                (product_id,))}
+            submitted_ids = {int(v["id"]) for v in variants if v["id"] is not None}
+            for variant_id in existing_ids - submitted_ids:
+                referenced = conn.execute(
+                    "SELECT 1 FROM order_items WHERE variant_id=? "
+                    "AND status!='served' AND status!='cancelled' LIMIT 1",
+                    (variant_id,)).fetchone()
+                if referenced:
+                    raise ApiError(409, "Variant is in use by an open ticket")
+                conn.execute("DELETE FROM product_variants WHERE id=?",
+                             (variant_id,))
+            for variant in variants:
+                if variant["id"] is not None:
+                    if not conn.execute("SELECT 1 FROM product_variants WHERE id=? AND product_id=?",
+                                        (int(variant["id"]), product_id)).fetchone():
+                        raise ApiError(404, "Variant not found")
+                    conn.execute(
+                        "UPDATE product_variants SET name=?,price_cents=?,stock_qty=?,"
+                        "is_default=?,sort_order=?,active=? WHERE id=?",
+                        (variant["name"], variant["price_cents"], variant["stock_qty"],
+                         variant["is_default"], variant["sort_order"],
+                         variant["active"], int(variant["id"])))
+                else:
+                    conn.execute(
+                        "INSERT INTO product_variants"
+                        "(product_id,name,price_cents,stock_qty,is_default,sort_order,active)"
+                        " VALUES(?,?,?,?,?,?,?)",
+                        (product_id, variant["name"], variant["price_cents"],
+                         variant["stock_qty"], variant["is_default"],
+                         variant["sort_order"], variant["active"]))
+        bump_rev(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"ok": True}
+
+def h_catalog_product_delete(args, body, conn):
+    branch_id = get_branch_id(body)
+    product_id = int(args[0])
+    require_product(conn, product_id, branch_id)
+    referenced = conn.execute(
+        "SELECT 1 FROM order_items WHERE variant_id IN "
+        "(SELECT id FROM product_variants WHERE product_id=?) "
+        "AND status IN ('sent','preparing','ready') LIMIT 1",
+        (product_id,)).fetchone()
+    if referenced:
+        raise ApiError(409, "Product is in use by an open ticket")
+    conn.execute("UPDATE products SET deleted_at=? WHERE id=?",
+                 (datetime.datetime.now().isoformat(), product_id))
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True}
+
+def h_catalog_variants_list(args, body, conn):
+    branch_id = get_branch_id(body)
+    product_id = int(args[0])
+    require_product(conn, product_id, branch_id)
+    return {"variants": [dict(r) for r in conn.execute(
+        "SELECT * FROM product_variants WHERE product_id=? "
+        "ORDER BY sort_order,id", (product_id,))]}
+
+def h_catalog_variant_create(args, body, conn):
+    branch_id = get_branch_id(body)
+    product_id = int(args[0])
+    require_product(conn, product_id, branch_id)
+    name = str(body.get("name") or "").strip()[:80]
+    if not name:
+        raise ApiError(400, "Variant name required")
+    variant = {
+        "name": name,
+        "price_cents": parse_cents(body.get("price_cents", 0)),
+        "stock_qty": parse_stock(body.get("stock_qty")),
+        "is_default": int(bool(body.get("is_default", 0))),
+        "sort_order": int(body.get("sort_order", 0)),
+        "active": int(bool(body.get("active", 1))),
+    }
+    if variant["is_default"]:
+        conn.execute("UPDATE product_variants SET is_default=0 "
+                     "WHERE product_id=? AND is_default=1", (product_id,))
+    try:
+        cur = conn.execute(
+            "INSERT INTO product_variants"
+            "(product_id,name,price_cents,stock_qty,is_default,sort_order,active)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (product_id, variant["name"], variant["price_cents"],
+             variant["stock_qty"], variant["is_default"],
+             variant["sort_order"], variant["active"]))
+        bump_rev(conn)
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise ApiError(400, "Duplicate variant name")
+    return {"ok": True, "variant_id": cur.lastrowid}
+
+def h_catalog_variant_update(args, body, conn):
+    branch_id = get_branch_id(body)
+    variant_id = int(args[0])
+    row = conn.execute(
+        "SELECT v.*,p.id product_id FROM product_variants v "
+        "JOIN products p ON p.id=v.product_id "
+        "JOIN sections s ON s.id=p.section_id "
+        "WHERE v.id=? AND s.branch_id=?", (variant_id, branch_id)).fetchone()
+    if not row:
+        raise ApiError(404, "Variant not found")
+    product_id = row["product_id"]
+    if "is_default" in body and int(bool(body["is_default"])):
+        conn.execute("UPDATE product_variants SET is_default=0 "
+                     "WHERE product_id=?", (product_id,))
+    fields = []
+    values = []
+    for key, column in (("name", "name"), ("price_cents", "price_cents"),
+                        ("stock_qty", "stock_qty"), ("sort_order", "sort_order"),
+                        ("active", "active"), ("is_default", "is_default")):
+        if key not in body:
+            continue
+        if key == "name":
+            value = str(body[key] or "").strip()[:80]
+            if not value:
+                raise ApiError(400, "Variant name required")
+        elif key == "price_cents":
+            value = parse_cents(body[key])
+        elif key == "stock_qty":
+            value = parse_stock(body[key])
+        elif key == "is_default":
+            value = int(bool(body[key]))
+        else:
+            value = int(body[key])
+        fields.append("%s=?" % column)
+        values.append(value)
+    if fields:
+        values.append(variant_id)
+        try:
+            conn.execute("UPDATE product_variants SET %s WHERE id=?"
+                         % ",".join(fields), values)
+        except sqlite3.IntegrityError:
+            raise ApiError(400, "Duplicate variant name")
+    defaults = conn.execute(
+        "SELECT COUNT(*) c FROM product_variants "
+        "WHERE product_id=? AND is_default=1", (product_id,)).fetchone()["c"]
+    active = conn.execute(
+        "SELECT COUNT(*) c FROM product_variants "
+        "WHERE product_id=? AND active=1", (product_id,)).fetchone()["c"]
+    if defaults != 1:
+        raise ApiError(400, "Product requires exactly one default variant")
+    if active < 1:
+        raise ApiError(400, "Product requires at least one active variant")
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True}
+
+def h_catalog_variants_replace(args, body, conn):
+    branch_id = get_branch_id(body)
+    product_id = int(args[0])
+    require_product(conn, product_id, branch_id)
+    variants = validate_variants(conn, product_id, body.get("variants"))
+    try:
+        conn.execute("BEGIN")
+        existing = {r["id"] for r in conn.execute(
+            "SELECT id FROM product_variants WHERE product_id=?", (product_id,))}
+        submitted_ids = {int(v["id"]) for v in variants if v["id"] is not None}
+        for variant_id in existing - submitted_ids:
+            if conn.execute(
+                    "SELECT 1 FROM order_items WHERE variant_id=? "
+                    "AND status IN ('sent','preparing','ready') LIMIT 1",
+                    (variant_id,)).fetchone():
+                raise ApiError(409, "Variant is in use by an open ticket")
+        conn.execute("DELETE FROM product_variants "
+                     "WHERE product_id=? AND id NOT IN (%s)" %
+                     ",".join("?" for _ in submitted_ids),
+                     (product_id, *submitted_ids)) if submitted_ids else conn.execute(
+                         "DELETE FROM product_variants WHERE product_id=?",
+                         (product_id,))
+        for variant in variants:
+            if variant["id"] is not None:
+                conn.execute(
+                    "UPDATE product_variants SET name=?,price_cents=?,stock_qty=?,"
+                    "is_default=?,sort_order=?,active=? WHERE id=? AND product_id=?",
+                    (variant["name"], variant["price_cents"], variant["stock_qty"],
+                     variant["is_default"], variant["sort_order"], variant["active"],
+                     int(variant["id"]), product_id))
+            else:
+                conn.execute(
+                    "INSERT INTO product_variants"
+                    "(product_id,name,price_cents,stock_qty,is_default,sort_order,active)"
+                    " VALUES(?,?,?,?,?,?,?)",
+                    (product_id, variant["name"], variant["price_cents"],
+                     variant["stock_qty"], variant["is_default"],
+                     variant["sort_order"], variant["active"]))
+        bump_rev(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"ok": True}
+
+def h_catalog_variant_delete(args, body, conn):
+    branch_id = get_branch_id(body)
+    variant_id = int(args[0])
+    row = conn.execute(
+        "SELECT v.*,p.id product_id FROM product_variants v "
+        "JOIN products p ON p.id=v.product_id "
+        "JOIN sections s ON s.id=p.section_id "
+        "WHERE v.id=? AND s.branch_id=?", (variant_id, branch_id)).fetchone()
+    if not row:
+        raise ApiError(404, "Variant not found")
+    referenced = conn.execute(
+        "SELECT 1 FROM order_items WHERE variant_id=? "
+        "AND status IN ('sent','preparing','ready') LIMIT 1",
+        (variant_id,)).fetchone()
+    if referenced:
+        raise ApiError(409, "Variant is in use by an open ticket")
+    remaining = conn.execute(
+        "SELECT COUNT(*) c FROM product_variants WHERE product_id=?",
+        (row["product_id"],)).fetchone()["c"]
+    if remaining <= 1:
+        raise ApiError(400, "Product requires at least one variant")
+    conn.execute("DELETE FROM product_variants WHERE id=?", (variant_id,))
+    defaults = conn.execute(
+        "SELECT COUNT(*) c FROM product_variants "
+        "WHERE product_id=? AND is_default=1",
+        (row["product_id"],)).fetchone()["c"]
+    if defaults == 0:
+        replacement = conn.execute(
+            "SELECT id FROM product_variants WHERE product_id=? AND active=1 "
+            "ORDER BY sort_order,id LIMIT 1",
+            (row["product_id"],)).fetchone()
+        if replacement:
+            conn.execute("UPDATE product_variants SET is_default=1 WHERE id=?",
+                         (replacement["id"],))
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True}
+
+def h_items_list(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    out = []
+    for row in conn.execute(
+            "SELECT i.*,v.id variant_id,v.price_cents,v.stock_qty variant_stock "
+            "FROM items i LEFT JOIN catalog_migration_items m ON m.item_id=i.id "
+            "LEFT JOIN product_variants v ON v.id=m.variant_id "
+            "WHERE i.branch_id=? ORDER BY i.position,i.id", (branch_id,)):
+        item = dict(row)
+        item["price_cents"] = item["price_cents"] if item["price_cents"] is not None else int(round(item["price"] * 100))
+        item["stock_qty"] = item["variant_stock"] if item["variant_stock"] is not None else item["stock_qty"]
+        out.append(item)
+    return {"items": out}
+
+def h_items_legacy_write(args, body, conn):
+    raise ApiError(405, "Legacy item writes are disabled; use /api/products")
+
+def h_catalog_groups_list(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    groups = []
+    for row in conn.execute(
+            "SELECT * FROM modifier_groups WHERE branch_id=? ORDER BY id",
+            (branch_id,)):
+        group = dict(row)
+        group["options"] = [dict(r) for r in conn.execute(
+            "SELECT * FROM modifier_options WHERE modifier_group_id=? "
+            "ORDER BY sort_order,id", (row["id"],))]
+        groups.append(group)
+    return {"modifier_groups": groups}
+
+def h_catalog_group_create(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    name = str(body.get("name") or "").strip()[:120]
+    selection_type = str(body.get("selection_type") or "multi")
+    min_select = int(body.get("min_select", 0))
+    max_select = int(body.get("max_select", 1))
+    if not name:
+        raise ApiError(400, "Modifier group name required")
+    if selection_type not in ("single", "multi"):
+        raise ApiError(400, "Invalid modifier selection type")
+    if min_select < 0 or max_select < min_select:
+        raise ApiError(400, "Invalid modifier group bounds")
+    try:
+        cur = conn.execute(
+            "INSERT INTO modifier_groups"
+            "(branch_id,name,selection_type,min_select,max_select)"
+            " VALUES(?,?,?,?,?)",
+            (branch_id, name, selection_type, min_select, max_select))
+        bump_rev(conn)
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise ApiError(409, "Modifier group name already exists")
+    return {"ok": True, "modifier_group_id": cur.lastrowid}
+
+def h_catalog_group_update(args, body, conn):
+    branch_id = get_branch_id(body)
+    group_id = int(args[0])
+    row = conn.execute(
+        "SELECT * FROM modifier_groups WHERE id=? AND branch_id=?",
+        (group_id, branch_id)).fetchone()
+    if not row:
+        raise ApiError(404, "Modifier group not found")
+    fields, values = [], []
+    if "name" in body:
+        name = str(body["name"] or "").strip()[:120]
+        if not name:
+            raise ApiError(400, "Modifier group name required")
+        fields.append("name=?")
+        values.append(name)
+    if "selection_type" in body:
+        if body["selection_type"] not in ("single", "multi"):
+            raise ApiError(400, "Invalid modifier selection type")
+        fields.append("selection_type=?")
+        values.append(body["selection_type"])
+    min_select = int(body.get("min_select", row["min_select"]))
+    max_select = int(body.get("max_select", row["max_select"]))
+    if "min_select" in body:
+        fields.append("min_select=?")
+        values.append(min_select)
+    if "max_select" in body:
+        fields.append("max_select=?")
+        values.append(max_select)
+    if min_select < 0 or max_select < min_select:
+        raise ApiError(400, "Invalid modifier group bounds")
+    if fields:
+        values.append(group_id)
+        try:
+            conn.execute("UPDATE modifier_groups SET %s WHERE id=?"
+                         % ",".join(fields), values)
+        except sqlite3.IntegrityError:
+            raise ApiError(409, "Modifier group name already exists")
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True}
+
+def h_catalog_group_delete(args, body, conn):
+    branch_id = get_branch_id(body)
+    group_id = int(args[0])
+    row = conn.execute(
+        "SELECT * FROM modifier_groups WHERE id=? AND branch_id=?",
+        (group_id, branch_id)).fetchone()
+    if not row:
+        raise ApiError(404, "Modifier group not found")
+    conn.execute("DELETE FROM modifier_groups WHERE id=?", (group_id,))
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True}
+
+def h_catalog_options_list(args, body, conn):
+    branch_id = get_branch_id(body)
+    group_id = int(args[0])
+    if not conn.execute(
+            "SELECT 1 FROM modifier_groups WHERE id=? AND branch_id=?",
+            (group_id, branch_id)).fetchone():
+        raise ApiError(404, "Modifier group not found")
+    return {"options": [dict(r) for r in conn.execute(
+        "SELECT * FROM modifier_options WHERE modifier_group_id=? "
+        "ORDER BY sort_order,id", (group_id,))]}
+
+def h_catalog_option_create(args, body, conn):
+    branch_id = get_branch_id(body)
+    group_id = int(args[0])
+    if not conn.execute(
+            "SELECT 1 FROM modifier_groups WHERE id=? AND branch_id=?",
+            (group_id, branch_id)).fetchone():
+        raise ApiError(404, "Modifier group not found")
+    name = str(body.get("name") or "").strip()[:80]
+    if not name:
+        raise ApiError(400, "Modifier option name required")
+    cents = int(body.get("price_delta_cents", 0))
+    if cents != body.get("price_delta_cents", 0):
+        raise ApiError(400, "Modifier delta must be an integer number of cents")
+    try:
+        cur = conn.execute(
+            "INSERT INTO modifier_options"
+            "(modifier_group_id,name,price_delta_cents,sort_order,active)"
+            " VALUES(?,?,?,?,?)",
+            (group_id, name, cents, int(body.get("sort_order", 0)),
+             int(bool(body.get("active", 1)))))
+        bump_rev(conn)
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise ApiError(409, "Modifier option name already exists")
+    return {"ok": True, "modifier_option_id": cur.lastrowid}
+
+def h_catalog_option_update(args, body, conn):
+    branch_id = get_branch_id(body)
+    option_id = int(args[0])
+    row = conn.execute(
+        "SELECT o.*,g.branch_id FROM modifier_options o "
+        "JOIN modifier_groups g ON g.id=o.modifier_group_id "
+        "WHERE o.id=?", (option_id,)).fetchone()
+    if not row or row["branch_id"] != branch_id:
+        raise ApiError(404, "Modifier option not found")
+    fields, values = [], []
+    if "name" in body:
+        name = str(body["name"] or "").strip()[:80]
+        if not name:
+            raise ApiError(400, "Modifier option name required")
+        fields.append("name=?")
+        values.append(name)
+    if "price_delta_cents" in body:
+        cents = int(body["price_delta_cents"])
+        if cents != body["price_delta_cents"]:
+            raise ApiError(400, "Modifier delta must be an integer number of cents")
+        fields.append("price_delta_cents=?")
+        values.append(cents)
+    for key, column in (("sort_order", "sort_order"), ("active", "active")):
+        if key in body:
+            fields.append("%s=? " % column)
+            values.append(int(bool(body[key])) if key == "active" else int(body[key]))
+    if fields:
+        values.append(option_id)
+        try:
+            conn.execute("UPDATE modifier_options SET %s WHERE id=?"
+                         % ",".join(f.strip() for f in fields), values)
+        except sqlite3.IntegrityError:
+            raise ApiError(409, "Modifier option name already exists")
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True}
+
+def h_catalog_option_delete(args, body, conn):
+    branch_id = get_branch_id(body)
+    option_id = int(args[0])
+    row = conn.execute(
+        "SELECT o.*,g.branch_id FROM modifier_options o "
+        "JOIN modifier_groups g ON g.id=o.modifier_group_id "
+        "WHERE o.id=?", (option_id,)).fetchone()
+    if not row or row["branch_id"] != branch_id:
+        raise ApiError(404, "Modifier option not found")
+    conn.execute("UPDATE modifier_options SET active=0 WHERE id=?", (option_id,))
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True}
+
+def h_catalog_product_groups(args, body, conn):
+    branch_id = get_branch_id(body)
+    product_id = int(args[0])
+    require_product(conn, product_id, branch_id)
+    attachments = body.get("modifier_groups")
+    if not isinstance(attachments, list):
+        raise ApiError(400, "Modifier groups must be a list")
+    conn.execute("BEGIN")
+    try:
+        conn.execute("DELETE FROM product_modifier_groups WHERE product_id=?",
+                     (product_id,))
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                raise ApiError(400, "Invalid modifier group attachment")
+            group_id = int(attachment["modifier_group_id"])
+            group = conn.execute(
+                "SELECT * FROM modifier_groups WHERE id=? AND branch_id=?",
+                (group_id, branch_id)).fetchone()
+            if not group:
+                raise ApiError(404, "Modifier group not found")
+            override_min = attachment.get("override_min")
+            override_max = attachment.get("override_max")
+            min_select = group["min_select"] if override_min is None else int(override_min)
+            max_select = group["max_select"] if override_max is None else int(override_max)
+            if min_select < 0 or max_select < min_select:
+                raise ApiError(400, "Invalid modifier group bounds")
+            conn.execute(
+                "INSERT INTO product_modifier_groups"
+                "(product_id,modifier_group_id,sort_order,override_min,override_max)"
+                " VALUES(?,?,?,?,?)",
+                (product_id, group_id, int(attachment.get("sort_order", 0)),
+                 override_min, override_max))
+        bump_rev(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"ok": True}
 def h_item_create(args, body, conn):
     branch_id = get_branch_id(body)
     require_branch(conn, branch_id)
@@ -1617,6 +2441,12 @@ def h_export(args, body, conn):
 
 ROUTES = [
     ("GET",    r"^/api/state$",                     h_state,          False),
+    ("GET",    r"^/api/sections$",                  h_catalog_sections, False),
+    ("GET",    r"^/api/products$",                  h_catalog_products_list, False),
+    ("GET",    r"^/api/items$",                     h_items_list,      False),
+    ("GET",    r"^/api/products/(\d+)/variants$",   h_catalog_variants_list, False),
+    ("GET",    r"^/api/modifier-groups$",           h_catalog_groups_list, False),
+    ("GET",    r"^/api/modifier-groups/(\d+)/options$", h_catalog_options_list, False),
     ("POST",   r"^/api/orders$",                    h_order_create,   False),
     ("POST",   r"^/api/orders/(\d+)/status$",       h_order_status,   False),
     ("POST",   r"^/api/orders/(\d+)/lines/(\d+)/status$", h_line_status, False),
@@ -1625,10 +2455,30 @@ ROUTES = [
     ("GET",    r"^/api/export$",                    h_export,         True),
     ("POST",   r"^/api/sections$",                  h_section_create, True),
     ("PUT",    r"^/api/sections/(\d+)$",            h_section_update, True),
+    ("PATCH",  r"^/api/sections/(\d+)$",            h_section_update, True),
     ("DELETE", r"^/api/sections/(\d+)$",            h_section_delete, True),
-    ("POST",   r"^/api/items$",                     h_item_create,    True),
-    ("PUT",    r"^/api/items/(\d+)$",               h_item_update,    True),
-    ("DELETE", r"^/api/items/(\d+)$",               h_item_delete,    True),
+    ("POST",   r"^/api/products$",                  h_catalog_product_create, True),
+    ("PATCH",  r"^/api/products/(\d+)$",            h_catalog_product_update, True),
+    ("PUT",    r"^/api/products/(\d+)$",            h_catalog_product_update, True),
+    ("DELETE", r"^/api/products/(\d+)$",            h_catalog_product_delete, True),
+    ("POST",   r"^/api/products/(\d+)/variants$",   h_catalog_variant_create, True),
+    ("PUT",    r"^/api/products/(\d+)/variants$",   h_catalog_variants_replace, True),
+    ("PATCH",  r"^/api/variants/(\d+)$",            h_catalog_variant_update, True),
+    ("PUT",    r"^/api/variants/(\d+)$",            h_catalog_variant_update, True),
+    ("DELETE", r"^/api/variants/(\d+)$",            h_catalog_variant_delete, True),
+    ("POST",   r"^/api/modifier-groups$",           h_catalog_group_create, True),
+    ("PATCH",  r"^/api/modifier-groups/(\d+)$",     h_catalog_group_update, True),
+    ("PUT",    r"^/api/modifier-groups/(\d+)$",     h_catalog_group_update, True),
+    ("DELETE", r"^/api/modifier-groups/(\d+)$",     h_catalog_group_delete, True),
+    ("POST",   r"^/api/modifier-groups/(\d+)/options$", h_catalog_option_create, True),
+    ("PATCH",  r"^/api/modifier-options/(\d+)$",    h_catalog_option_update, True),
+    ("PUT",    r"^/api/modifier-options/(\d+)$",    h_catalog_option_update, True),
+    ("DELETE", r"^/api/modifier-options/(\d+)$",   h_catalog_option_delete, True),
+    ("PUT",    r"^/api/products/(\d+)/modifier-groups$", h_catalog_product_groups, True),
+    ("POST",   r"^/api/items$",                     h_items_legacy_write, True),
+    ("PATCH",  r"^/api/items/(\d+)$",               h_items_legacy_write, True),
+    ("PUT",    r"^/api/items/(\d+)$",               h_items_legacy_write, True),
+    ("DELETE", r"^/api/items/(\d+)$",               h_items_legacy_write, True),
     ("POST",   r"^/api/staff$",                     h_staff_create,   True),
     ("PUT",    r"^/api/staff/(\d+)$",               h_staff_update,   True),
     ("DELETE", r"^/api/staff/(\d+)$",               h_staff_delete,   True),
@@ -1702,7 +2552,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Pin, X-Branch-ID, X-Actor-Role, X-Actor-ID")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE")
         if extra:
             for k, v in extra.items():
                 self.send_header(k, v)
@@ -1849,6 +2699,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         self._audit_request("PUT", lambda: self._route("PUT", urlparse(self.path).path))
 
+    def do_PATCH(self):
+        self._audit_request("PATCH", lambda: self._route("PATCH", urlparse(self.path).path))
+
     def do_DELETE(self):
         self._audit_request("DELETE", lambda: self._route("DELETE", urlparse(self.path).path))
 
@@ -1861,9 +2714,11 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             try:
                 body = (self._body(3_000_000 if re.match(r"^/api/items/\d+/image$", path) else 1_000_000)
-                        if method in ("POST", "PUT", "DELETE")
+                        if method in ("POST", "PUT", "PATCH", "DELETE")
                         else {"lang": (query or {}).get("lang", ["en"])[0],
-                              "period": (query or {}).get("period", ["7d"])[0]})
+                              "period": (query or {}).get("period", ["7d"])[0],
+                              "section_id": (query or {}).get("section_id", [None])[0],
+                              "q": (query or {}).get("q", [""])[0]})
                 body["branch_id"] = self.headers.get("X-Branch-ID") or (
                     (query or {}).get("branch_id", [body.get("branch_id", 1)])[0])
                 # Audit field names and low-risk allowlisted values only.

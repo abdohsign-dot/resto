@@ -103,10 +103,157 @@ class RestaurantFeatureTests(unittest.TestCase):
         variant_id = self.conn.execute(
             "SELECT variant_id FROM catalog_migration_items WHERE item_id=?",
             (item["id"],)).fetchone()["variant_id"]
-        with self.assertRaises(sqlite3.IntegrityError):
+        with self.assertRaises(server.ApiError) as error:
+            server.h_catalog_variant_update(
+                [str(variant_id)],
+                {"branch_id": 1, "is_default": 0},
+                self.conn)
+        self.assertEqual(error.exception.code, 400)
+
+    def test_catalog_product_order_modifiers_and_legacy_write(self):
+        section = self.conn.execute("SELECT id FROM sections LIMIT 1").fetchone()
+        result = server.h_catalog_product_create([], {
+            "branch_id": 1,
+            "section_id": section["id"],
+            "name": "Catalog Pizza",
+            "variants": [
+                {"name": "Small", "price_cents": 800, "stock_qty": 5,
+                 "is_default": 1, "active": 1},
+                {"name": "Large", "price_cents": 1400, "stock_qty": 3,
+                 "is_default": 0, "active": 1},
+            ],
+        }, self.conn)
+        product_id = result["product_id"]
+        group = server.h_catalog_group_create([], {
+            "branch_id": 1, "name": "Extras", "selection_type": "multi",
+            "min_select": 1, "max_select": 2,
+        }, self.conn)
+        option = server.h_catalog_option_create([str(group["modifier_group_id"])], {
+            "branch_id": 1, "name": "Extra cheese",
+            "price_delta_cents": 200,
+        }, self.conn)
+        server.h_catalog_product_groups([str(product_id)], {
+            "branch_id": 1,
+            "modifier_groups": [{
+                "modifier_group_id": group["modifier_group_id"],
+                "override_min": 1,
+                "override_max": 2,
+            }],
+        }, self.conn)
+        small = self.conn.execute(
+            "SELECT id FROM product_variants "
+            "WHERE product_id=? AND name='Small'", (product_id,)).fetchone()
+        large = self.conn.execute(
+            "SELECT id FROM product_variants "
+            "WHERE product_id=? AND name='Large'", (product_id,)).fetchone()
+        order = server.h_catalog_order_create({
+            "branch_id": 1,
+            "table_no": 9,
+            "client_uuid": "catalog-order",
+            "lines": [{
+                "product_id": product_id,
+                "variant_id": large["id"],
+                "modifier_option_ids": [option["modifier_option_id"]],
+                "qty": 2,
+            }],
+        }, self.conn, 1)
+        line = self.conn.execute(
+            "SELECT price,unit_price_cents,variant_name,modifiers_json,"
+            "stock_debited FROM order_items WHERE order_id=?",
+            (order["order_id"],)).fetchone()
+        self.assertEqual(line["unit_price_cents"], 1600)
+        self.assertEqual(line["variant_name"], "Large")
+        self.assertEqual(
+            json.loads(line["modifiers_json"])[0]["delta"], 200)
+        self.assertEqual(
             self.conn.execute(
-                "UPDATE product_variants SET is_default=0 WHERE id=?",
-                (variant_id,))
+                "SELECT stock_qty FROM product_variants WHERE id=?",
+                (large["id"],)).fetchone()[0], 1)
+        with self.assertRaises(server.ApiError) as error:
+            server.h_items_legacy_write([], {"branch_id": 1}, self.conn)
+        self.assertEqual(error.exception.code, 405)
+
+    def test_catalog_historical_price_and_variant_cancel_stock(self):
+        section = self.conn.execute("SELECT id FROM sections LIMIT 1").fetchone()
+        product = server.h_catalog_product_create([], {
+            "branch_id": 1,
+            "section_id": section["id"],
+            "name": "Snapshot Pizza",
+            "variants": [{
+                "name": "Large", "price_cents": 1400,
+                "stock_qty": 4, "is_default": 1, "active": 1,
+            }],
+        }, self.conn)
+        product_id = product["product_id"]
+        variant = self.conn.execute(
+            "SELECT id FROM product_variants WHERE product_id=?",
+            (product_id,)).fetchone()
+        order = server.h_catalog_order_create({
+            "table_no": 5,
+            "lines": [{
+                "product_id": product_id,
+                "variant_id": variant["id"],
+                "modifier_option_ids": [],
+                "qty": 1,
+            }],
+        }, self.conn, 1)
+        server.h_catalog_variant_update([str(variant["id"])], {
+            "branch_id": 1,
+            "price_cents": 1900,
+        }, self.conn)
+        loaded = server.get_order(self.conn, order["order_id"])
+        self.assertEqual(loaded["lines"][0]["unit_price_cents"], 1400)
+        server.h_order_status([str(order["order_id"])], {
+            "branch_id": 1,
+            "status": "cancelled",
+        }, self.conn)
+        restored = self.conn.execute(
+            "SELECT stock_qty FROM product_variants WHERE id=?",
+            (variant["id"],)).fetchone()[0]
+        self.assertEqual(restored, 4)
+
+    def test_catalog_modifier_and_variant_validation(self):
+        section = self.conn.execute("SELECT id FROM sections LIMIT 1").fetchone()
+        product = server.h_catalog_product_create([], {
+            "branch_id": 1,
+            "section_id": section["id"],
+            "name": "Validation Pizza",
+            "variants": [{
+                "name": "Regular", "price_cents": 1000,
+                "stock_qty": 2, "is_default": 1, "active": 1,
+            }],
+        }, self.conn)
+        product_id = product["product_id"]
+        with self.assertRaises(server.ApiError):
+            server.h_catalog_product_create([], {
+                "branch_id": 1, "section_id": section["id"],
+                "name": "No variants", "variants": [],
+            }, self.conn)
+        group = server.h_catalog_group_create([], {
+            "branch_id": 1, "name": "Required Crust",
+            "selection_type": "single", "min_select": 1, "max_select": 1,
+        }, self.conn)
+        server.h_catalog_product_groups([str(product_id)], {
+            "branch_id": 1,
+            "modifier_groups": [{
+                "modifier_group_id": group["modifier_group_id"],
+                "override_min": 1, "override_max": 1,
+            }],
+        }, self.conn)
+        variant = self.conn.execute(
+            "SELECT id FROM product_variants WHERE product_id=?",
+            (product_id,)).fetchone()
+        with self.assertRaises(server.ApiError) as error:
+            server.h_catalog_order_create({
+                "table_no": 4,
+                "lines": [{
+                    "product_id": product_id,
+                    "variant_id": variant["id"],
+                    "modifier_option_ids": [],
+                    "qty": 1,
+                }],
+            }, self.conn, 1)
+        self.assertEqual(error.exception.code, 400)
 
     def test_branch_copy_is_isolated(self):
         source = server.h_state([], {"branch_id": 1}, self.conn)
