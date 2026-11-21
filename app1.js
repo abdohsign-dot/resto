@@ -56,6 +56,7 @@ var S = {
   tableNo: null, search: '', sectionFilter: 0, adminTab: 'sections',
   adminItemFilter: 0, adminSearch: '', cart: {}, queue: [], seen: {}, pollT: null,
   adminPin: null, lang: 'fr',
+  catalogProducts: [], catalogGroups: [], catalogLoadedFor: null, adminProductId: null,
   kitchenStation: null, kitchenStationFilter: null
 };
 
@@ -439,6 +440,7 @@ function changeBranch(value) {
   S.branchId = next;
   saveLS('ro_branch', next);
   S.waiterId = null; S.tableNo = null; S.cart = {};
+  S.catalogLoadedFor = null; S.catalogProducts = []; S.catalogGroups = [];
   sessionStorage.removeItem('ro_waiter'); saveLS('ro_cart', {});
   S.rev = -1; poll();
   if (S.role === 'admin' && S.adminTab === 'sales') loadSales(S.salesPeriod || '7d');

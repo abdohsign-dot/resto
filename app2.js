@@ -133,7 +133,7 @@ function ticketCard(o, actions) {
       (!o.bill_requested && o.status !== 'cancelled'
         ? '<button class="btn small" onclick="requestBill(' + o.id + ')">' + tr('requestBill') + '</button>' : '') +
       (o.status === 'ready' ? '<button class="btn small green" onclick="serveOrder(' + o.id + ')">✓ ' + tr('served') + '</button>' : '') +
-      '<button class="btn small danger" onclick="cancelOrderDlg(' + o.id + ')">✕ ' + tr('cancel') + '</button>' +
+      '<button class="btn small danger" onclick="cancelOrderDlg(' + o.id + ')">✕ ' + tr('cancel') + '</button>';
   }
   acts += '</div>';
   return '<div class="ticket st-' + o.status + '">' +

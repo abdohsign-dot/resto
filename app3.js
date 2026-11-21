@@ -107,6 +107,7 @@ function renderAdmin(app) {
 }
 function setTab(t) {
   S.adminTab = t; S.adminSearch = ''; render();
+  if (t === 'items') loadCatalogEditor();
   if (t === 'sales') loadSales('7d');
 }
 
@@ -236,98 +237,240 @@ async function doDeleteSection(id) {
   catch (e) { closeDlg(); toast(e.message); }
 }
 
-// ---- items tab ----
+// ---- catalog items tab ----
+async function loadCatalogEditor() {
+  var key = S.branchId;
+  if (S.catalogLoadedFor === key) return;
+  try {
+    var products = await api('/api/products');
+    var groups = await api('/api/modifier-groups');
+    S.catalogProducts = products.products || [];
+    S.catalogGroups = groups.modifier_groups || [];
+    S.catalogLoadedFor = key;
+    render();
+  } catch (e) {
+    toast(e.message || tr('needConnection'));
+  }
+}
+
 function sectionName(id) {
   var s = (S.data.sections || []).filter(function (x) { return x.id === id; })[0];
   return s ? localizedLabel(s.name) : '?';
 }
+
 function adminItems() {
-  var secs = S.data.sections || [];
-  var q = S.adminSearch.trim().toLowerCase();
-  var items = (S.data.items || []).filter(function (i) {
-    if (S.adminItemFilter && i.section_id !== S.adminItemFilter) return false;
-    if (q && (localizedLabel(i.name) + ' ' + i.name).toLowerCase().indexOf(q) < 0) return false;
-    return true;
-  });
-  var opts = '<option value="0">' + tr('allSections') + '</option>' + secs.map(function (s) {
-    return '<option value="' + s.id + '"' + (S.adminItemFilter === s.id ? ' selected' : '') + '>' + esc(localizedLabel(s.name)) + '</option>';
-  }).join('');
-  var rows = items.map(function (i) {
-    return '<article class="admin-menu-tile">' +
-      '<button class="admin-menu-photo" onclick="itemDlg(' + i.id + ')" aria-label="' + esc(localizedLabel(i.name)) + '">' +
-        (i.image_url ? '<img src="' + esc(i.image_url) + '" alt="' + esc(localizedLabel(i.name)) + '">' : '<span aria-hidden="true">🍽️</span>') +
-      '</button>' +
-      '<div class="admin-menu-info"><div class="admin-menu-name">' + esc(localizedLabel(i.name)) + '</div>' +
-        '<div class="admin-menu-meta"><span>' + esc(sectionName(i.section_id)) + '</span><b>' + money(i.price) + '</b></div>' +
-        '<div class="admin-menu-meta"><span class="tag ' + (i.active ? 'on' : 'off') + '">' + (i.active ? tr('active') : tr('hidden')) + '</span>' +
-          '<span class="dim">' + tr('inventory') + ': ' + (i.stock_qty == null ? '∞' : i.stock_qty) + '</span></div>' +
-      '</div><div class="admin-menu-actions">' +
-        '<button class="btn small" onclick="itemDlg(' + i.id + ')">✎ ' + tr('editItem') + '</button>' +
-        '<button class="btn small danger" onclick="deleteItem(' + i.id + ')">🗑</button>' +
-      '</div></article>';
-  }).join('');
-  return '<div class="searchrow"><select class="in" style="flex:0 0 auto;width:auto" onchange="setItemFilter(this.value)">' + opts + '</select>' +
-    '<input id="f-asearch" class="in" placeholder="' + tr('searchItems') + '" value="' + esc(S.adminSearch) + '" oninput="setAdminSearch(this.value)">' +
-    '<button class="btn primary" style="flex:0 0 auto" onclick="itemDlg(0)">' + tr('addItem') + '</button></div>' +
-    '<div class="admin-menu-grid">' + (rows || '<div class="empty">' + tr('noItemsMatch') + '</div>') + '</div>';
-}
-function setItemFilter(v) { S.adminItemFilter = parseInt(v) || 0; render(); }
-function setAdminSearch(v) { S.adminSearch = v; render(); }
-async function itemDlg(id) {
-  var it = id ? (S.data.items || []).filter(function (x) { return x.id === id; })[0]
-              : { name: '', price: '', section_id: (S.adminItemFilter || (S.data.sections[0] || {}).id || 0), description: '', active: 1, modifiers: '[]', stock_qty: null };
-  var modifiers = [];
-  try { modifiers = JSON.parse(it.modifiers || '[]'); } catch (e) {}
-  var opts = (S.data.sections || []).map(function (s) {
-    return '<option value="' + s.id + '"' + (it.section_id === s.id ? ' selected' : '') + '>' + esc(localizedLabel(s.name)) + '</option>';
-  }).join('');
-  dlg('<h2>' + (id ? tr('editItem') : tr('newItem')) + '</h2>' +
-    '<label class="f">' + tr('name') + '</label><input id="f-i-name" class="in" value="' + esc(localizedLabel(it.name)) + '" placeholder="' + tr('itemNamePlaceholder') + '">' +
-    '<label class="f">' + tr('price') + ' (' + esc(S.data.currency) + ')</label><input id="f-i-price" class="in" type="number" step="0.01" min="0" inputmode="decimal" value="' + esc(it.price) + '">' +
-    '<label class="f">' + tr('section') + '</label><select id="f-i-sec" class="in">' + opts + '</select>' +
-    '<label class="f">' + tr('description') + '</label><input id="f-i-desc" class="in" value="' + esc(it.description || '') + '" placeholder="' + tr('descriptionPlaceholder') + '">' +
-    '<label class="f">' + tr('stock') + '</label><input id="f-i-stock" class="in" type="number" min="0" step="1" value="' + (it.stock_qty == null ? '' : it.stock_qty) + '">' +
-    '<label class="f">' + tr('modifiers') + '</label><textarea id="f-i-modifiers" class="in" rows="3">' +
-      esc(modifiers.map(function (m) { return m.name + ':' + m.price; }).join('\n')) + '</textarea>' +
-    '<label class="f">' + tr('image') + '</label>' +
-    (it.image_url ? '<img class="admin-image" src="' + esc(it.image_url) + '" alt="">' : '') +
-    '<input id="f-i-image" class="in" type="file" accept="image/png,image/jpeg,image/webp">' +
-    '<label class="f"><input type="checkbox" id="f-i-active"' + (it.active ? ' checked' : '') + '> ' + tr('activeOnWaiter') + '</label>' +
-    '<div class="dlg-foot"><button class="btn" onclick="closeDlg()">' + tr('cancel') + '</button>' +
-    '<button class="btn primary" onclick="saveItem(' + (id || 0) + ')">' + tr('save') + '</button></div>');
-}
-function parseModifierText(text) {
-  if (!text.trim()) return [];
-  return text.split('\n').map(function (line) {
-    var parts = line.split(':');
-    if (parts.length !== 2 || !parts[0].trim() || !isFinite(Number(parts[1])) || Number(parts[1]) < 0)
-      throw new Error(tr('modifiers'));
-    return { name: parts[0].trim(), price: Number(Number(parts[1]).toFixed(2)) };
-  });
-}
-async function saveItem(id) {
-  var modifiers;
-  try { modifiers = parseModifierText(val('f-i-modifiers')); }
-  catch (e) { toast(e.message); return; }
-  var body = {
-    name: sourceLabel(val('f-i-name')),
-    price: parseFloat(val('f-i-price') || 'nan'),
-    section_id: parseInt(val('f-i-sec')) || 0,
-    description: val('f-i-desc'),
-    active: chk('f-i-active') ? 1 : 0,
-    stock_qty: val('f-i-stock') === '' ? null : parseInt(val('f-i-stock'), 10),
-    modifiers: modifiers
-  };
-  if (!body.name) { toast(tr('nameRequired')); return; }
-  if (isNaN(body.price) || body.price < 0) { toast(tr('validPrice')); return; }
-  if (body.stock_qty !== null && (!Number.isInteger(body.stock_qty) || body.stock_qty < 0)) {
-    toast(tr('stock')); return;
+  if (S.catalogLoadedFor !== S.branchId) {
+    loadCatalogEditor();
+    return '<div class="loading">' + tr('loading') + '</div>';
   }
-  var itemId = id;
+  var q = S.adminSearch.trim().toLowerCase();
+  var sections = (S.data.sections || []).slice().sort(function (a, b) {
+    return (a.position || 0) - (b.position || 0) || a.id - b.id;
+  });
+  var filtered = S.catalogProducts.filter(function (p) {
+    if (S.adminItemFilter && p.section_id !== S.adminItemFilter) return false;
+    return !q || (localizedLabel(p.name) + ' ' + p.name).toLowerCase().indexOf(q) >= 0;
+  });
+  if (S.adminProductId && !S.catalogProducts.some(function (p) { return p.id === S.adminProductId; })) {
+    S.adminProductId = null;
+  }
+  var sectionHtml = sections.map(function (s) {
+    var count = S.catalogProducts.filter(function (p) {
+      return p.section_id === s.id && p.deleted_at == null;
+    }).length;
+    return '<button class="catalog-pane-item ' + (S.adminItemFilter === s.id ? 'on' : '') +
+      '" onclick="setCatalogSection(' + s.id + ')"><span>' + esc(localizedLabel(s.name)) + '</span><span class="tag">' + count + '</span></button>';
+  }).join('');
+  var productHtml = filtered.map(function (p) {
+    var defaultVariant = (p.variants || []).filter(function (v) { return v.is_default; })[0] ||
+      (p.variants || [])[0];
+    return '<button class="catalog-pane-item ' + (S.adminProductId === p.id ? 'on' : '') +
+      '" onclick="selectCatalogProduct(' + p.id + ')"><span>' +
+      esc(localizedLabel(p.name)) + '</span><span class="dim">' +
+      (defaultVariant ? money(defaultVariant.price_cents / 100) : '') + '</span></button>';
+  }).join('');
+  var product = S.catalogProducts.filter(function (p) { return p.id === S.adminProductId; })[0] || null;
+  var editor = catalogProductEditor(product);
+  return '<div class="searchrow"><input id="f-catalog-search" class="in" placeholder="' +
+    tr('searchItems') + '" value="' + esc(S.adminSearch) +
+    '" oninput="setAdminSearch(this.value)">' +
+    '<button class="btn primary" onclick="selectCatalogProduct(0)">＋ ' + tr('newItem') + '</button></div>' +
+    '<div class="catalog-editor"><aside class="catalog-pane catalog-sections"><h3>' +
+    tr('sections') + '</h3><button class="catalog-pane-item ' + (!S.adminItemFilter ? 'on' : '') +
+    '" onclick="setCatalogSection(0)"><span>' + tr('allSections') + '</span></button>' +
+    sectionHtml + '</aside><aside class="catalog-pane catalog-products"><h3>' +
+    tr('menuTab') + '</h3><div>' + (productHtml || '<div class="empty">' + tr('noItemsMatch') + '</div>') +
+    '</div></aside><section class="catalog-pane catalog-product-editor">' +
+    editor + '</section></div>';
+}
+
+function setCatalogSection(id) {
+  S.adminItemFilter = parseInt(id) || 0;
+  S.adminProductId = null;
+  render();
+}
+
+function selectCatalogProduct(id) {
+  S.adminProductId = id ? parseInt(id) : 0;
+  render();
+}
+
+function setAdminSearch(v) { S.adminSearch = v; render(); }
+
+function catalogVariantRows(product) {
+  var variants = product ? (product.variants || []) : [{
+    id: null, name: 'Regular', price_cents: 0, stock_qty: null,
+    is_default: 1, sort_order: 0, active: 1
+  }];
+  return variants.map(function (v, index) {
+    return '<div class="catalog-variant-row" data-variant-id="' + (v.id || '') + '">' +
+      '<input class="in catalog-v-name" value="' + esc(v.name || '') + '" placeholder="Name">' +
+      '<input class="in catalog-v-price" type="number" min="0" step="0.01" inputmode="decimal" value="' +
+      ((v.price_cents || 0) / 100).toFixed(2) + '" placeholder="Price">' +
+      '<input class="in catalog-v-stock" type="number" min="0" step="1" value="' +
+      (v.stock_qty == null ? '' : v.stock_qty) + '" placeholder="Stock">' +
+      '<label title="Default"><input class="catalog-v-default" type="radio" name="catalog-default"' +
+      (v.is_default ? ' checked' : '') + '></label>' +
+      '<button type="button" class="btn small danger" onclick="removeCatalogVariant(this)">×</button>' +
+      '</div>';
+  }).join('');
+}
+
+function catalogProductEditor(product) {
+  if (S.adminProductId === 0 || (!S.adminProductId && !product)) {
+    product = {
+      id: null, section_id: S.adminItemFilter || (S.data.sections[0] || {}).id || 0,
+      name: '', description: '', image_path: '', active: 1,
+      variants: [{ id: null, name: 'Regular', price_cents: 0, stock_qty: null,
+        is_default: 1, sort_order: 0, active: 1 }],
+      modifier_groups: []
+    };
+  }
+  if (!product) {
+    return '<div class="empty">Select a product or create a new one.</div>';
+  }
+  var sectionOptions = (S.data.sections || []).map(function (s) {
+    return '<option value="' + s.id + '"' + (product.section_id === s.id ? ' selected' : '') +
+      '>' + esc(localizedLabel(s.name)) + '</option>';
+  }).join('');
+  var attached = {};
+  (product.modifier_groups || []).forEach(function (g) {
+    attached[g.modifier_group_id] = g;
+  });
+  var groupOptions = S.catalogGroups.map(function (g) {
+    var attachment = attached[g.id];
+    return '<label class="catalog-group-option"><input type="checkbox" value="' + g.id + '"' +
+      (attachment ? ' checked' : '') + '> ' + esc(g.name) +
+      '<span class="dim">' + (g.selection_type === 'single' ? 'choose 1' : 'up to ' + g.max_select) +
+      '</span><input class="in catalog-group-min" data-group-id="' + g.id +
+      '" type="number" min="0" value="' + (attachment && attachment.override_min != null ?
+        attachment.override_min : g.min_select) + '" title="Min">' +
+      '<input class="in catalog-group-max" data-group-id="' + g.id +
+      '" type="number" min="0" value="' + (attachment && attachment.override_max != null ?
+        attachment.override_max : g.max_select) + '" title="Max"></label>';
+  }).join('');
+  return '<h3>' + (product.id ? 'Edit product' : 'New product') + '</h3>' +
+    '<div id="catalog-product-error" class="error-text"></div>' +
+    '<label class="f">Name</label><input id="catalog-p-name" class="in" value="' +
+    esc(localizedLabel(product.name || '')) + '">' +
+    '<label class="f">Section</label><select id="catalog-p-section" class="in">' + sectionOptions + '</select>' +
+    '<label class="f">Description</label><textarea id="catalog-p-description" class="in" rows="3">' +
+    esc(product.description || '') + '</textarea>' +
+    '<label class="f">Image</label>' + (product.image_path ?
+      '<img class="admin-image" src="' + esc(product.image_path) + '" alt="">' : '') +
+    '<input id="catalog-p-image" class="in" type="file" accept="image/png,image/jpeg,image/webp">' +
+    '<label class="f"><input id="catalog-p-active" type="checkbox"' +
+    (product.active ? ' checked' : '') + '> Active</label>' +
+    '<h3 class="catalog-subhead">Variants</h3><div id="catalog-variants">' +
+    catalogVariantRows(product) + '</div>' +
+    '<button type="button" class="btn small" onclick="addCatalogVariant()">＋ Add variant</button>' +
+    '<h3 class="catalog-subhead">Modifier groups</h3><div class="catalog-groups">' +
+    (groupOptions || '<div class="dim">No modifier groups.</div>') + '</div>' +
+    '<div class="dlg-foot">' +
+    (product.id ? '<button class="btn danger" onclick="deleteCatalogProduct(' + product.id + ')">Delete</button>' : '') +
+    '<button class="btn primary" onclick="saveCatalogProduct(' + (product.id || 0) + ')">Save</button></div>';
+}
+
+function addCatalogVariant() {
+  var container = document.getElementById('catalog-variants');
+  if (!container) return;
+  container.insertAdjacentHTML('beforeend',
+    '<div class="catalog-variant-row" data-variant-id=""><input class="in catalog-v-name" value="" placeholder="Name">' +
+    '<input class="in catalog-v-price" type="number" min="0" step="0.01" value="0" placeholder="Price">' +
+    '<input class="in catalog-v-stock" type="number" min="0" step="1" value="" placeholder="Stock">' +
+    '<label title="Default"><input class="catalog-v-default" type="radio" name="catalog-default"></label>' +
+    '<button type="button" class="btn small danger" onclick="removeCatalogVariant(this)">×</button></div>');
+}
+
+function removeCatalogVariant(button) {
+  var row = button.closest('.catalog-variant-row');
+  if (row) row.remove();
+}
+
+function catalogInlineError(message) {
+  var el = document.getElementById('catalog-product-error');
+  if (el) el.textContent = message;
+  toast(message);
+}
+
+async function saveCatalogProduct(id) {
+  var name = val('catalog-p-name');
+  if (!name) { catalogInlineError(tr('nameRequired')); return; }
+  var rows = Array.prototype.slice.call(document.querySelectorAll('.catalog-variant-row'));
+  if (!rows.length) { catalogInlineError('Product requires at least one variant'); return; }
+  var defaults = 0;
+  var names = {};
+  var variants = rows.map(function (row) {
+    var variantName = row.querySelector('.catalog-v-name').value.trim();
+    var price = parseFloat(row.querySelector('.catalog-v-price').value);
+    var stockText = row.querySelector('.catalog-v-stock').value;
+    var isDefault = row.querySelector('.catalog-v-default').checked ? 1 : 0;
+    defaults += isDefault;
+    names[variantName] = (names[variantName] || 0) + 1;
+    return {
+      id: row.getAttribute('data-variant-id') ? parseInt(row.getAttribute('data-variant-id')) : null,
+      name: variantName,
+      price_cents: isFinite(price) ? Math.round(price * 100) : -1,
+      stock_qty: stockText === '' ? null : parseInt(stockText, 10),
+      is_default: isDefault,
+      sort_order: rows.indexOf(row),
+      active: 1
+    };
+  });
+  if (defaults !== 1) { catalogInlineError('Exactly one default variant is required'); return; }
+  if (variants.some(function (v) { return !v.name || v.price_cents < 0; })) {
+    catalogInlineError('Variant names and non-negative prices are required');
+    return;
+  }
+  if (Object.keys(names).some(function (n) { return !n || names[n] > 1; })) {
+    catalogInlineError('Variant names must be unique');
+    return;
+  }
+  var modifierGroups = [];
+  document.querySelectorAll('.catalog-group-option input[type="checkbox"]:checked').forEach(function (box) {
+    var groupId = parseInt(box.value, 10);
+    var minInput = document.querySelector('.catalog-group-min[data-group-id="' + groupId + '"]');
+    var maxInput = document.querySelector('.catalog-group-max[data-group-id="' + groupId + '"]');
+    modifierGroups.push({
+      modifier_group_id: groupId,
+      override_min: minInput && minInput.value !== '' ? parseInt(minInput.value, 10) : null,
+      override_max: maxInput && maxInput.value !== '' ? parseInt(maxInput.value, 10) : null,
+      sort_order: modifierGroups.length
+    });
+  });
+  var body = {
+    name: sourceLabel(name),
+    section_id: parseInt(val('catalog-p-section'), 10),
+    description: val('catalog-p-description'),
+    active: chk('catalog-p-active') ? 1 : 0,
+    variants: variants,
+    modifier_groups: modifierGroups
+  };
   try {
-    if (id) await api('/api/items/' + id, 'PUT', body);
-    else itemId = (await api('/api/items', 'POST', body)).item_id;
-    var file = document.getElementById('f-i-image').files[0];
+    var productId = id;
+    if (id) await api('/api/products/' + id, 'PATCH', body);
+    else productId = (await api('/api/products', 'POST', body)).product_id;
+    var file = document.getElementById('catalog-p-image').files[0];
     if (file) {
       if (file.size > 2000000) throw new Error('Image size must be at most 2 MB');
       var dataUrl = await new Promise(function (resolve, reject) {
@@ -336,31 +479,38 @@ async function saveItem(id) {
         reader.onerror = function () { reject(new Error('Could not read image')); };
         reader.readAsDataURL(file);
       });
-      await api('/api/items/' + itemId + '/image', 'PUT', {
+      await api('/api/products/' + productId + '/image', 'PUT', {
         mime: file.type, data: String(dataUrl).split(',')[1]
       });
     }
-    closeDlg(); toast(tr('saved')); poll();
+    S.catalogLoadedFor = null;
+    S.adminProductId = productId;
+    await loadCatalogEditor();
+    toast(tr('saved'));
   } catch (e) {
-    if (itemId) poll();
-    toast(e.code ? e.message : (e.message || tr('needConnection')));
+    catalogInlineError(e.code ? e.message : (e.message || tr('needConnection')));
   }
 }
-function toggleItem(id, v) {
-  api('/api/items/' + id, 'PUT', { active: v })
-    .then(function () { poll(); })
-    .catch(function (e) { toast(e.code ? e.message : tr('needConnection')); });
+
+function deleteCatalogProduct(id) {
+  dlg('<h2>' + tr('deleteQuestion') + '</h2><p class="dim">' + tr('pastTicketsKept') + '</p>' +
+    '<div class="dlg-foot"><button class="btn" onclick="closeDlg()">' + tr('keep') +
+    '</button><button class="btn danger" onclick="doDeleteCatalogProduct(' + id + ')">' +
+    tr('delete') + '</button></div>');
 }
-function deleteItem(id) {
-  var it = (S.data.items || []).filter(function (x) { return x.id === id; })[0];
-  dlg('<h2>' + tr('deleteQuestion') + esc(it ? localizedLabel(it.name) : '') + tr('deleteSuffix') + '</h2>' +
-    '<p class="dim">' + tr('pastTicketsKept') + '</p>' +
-    '<div class="dlg-foot"><button class="btn" onclick="closeDlg()">' + tr('keep') + '</button>' +
-    '<button class="btn danger" onclick="doDeleteItem(' + id + ')">' + tr('delete') + '</button></div>');
-}
-async function doDeleteItem(id) {
-  try { await api('/api/items/' + id, 'DELETE'); closeDlg(); toast(tr('deleted')); poll(); }
-  catch (e) { closeDlg(); toast(e.message); }
+
+async function doDeleteCatalogProduct(id) {
+  try {
+    await api('/api/products/' + id, 'DELETE');
+    closeDlg();
+    S.catalogLoadedFor = null;
+    S.adminProductId = null;
+    await loadCatalogEditor();
+    toast(tr('deleted'));
+  } catch (e) {
+    closeDlg();
+    toast(e.message);
+  }
 }
 
 // ---- waiters tab ----

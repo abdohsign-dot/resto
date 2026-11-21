@@ -1383,6 +1383,12 @@ def h_catalog_products_list(args, body, conn):
             "SELECT * FROM product_variants WHERE product_id=? "
             "ORDER BY sort_order,id", (product["id"],))]
         product["variants"] = variants
+        product["modifier_groups"] = [dict(r) for r in conn.execute(
+            "SELECT pmg.*,g.name,g.selection_type,g.min_select,g.max_select "
+            "FROM product_modifier_groups pmg "
+            "JOIN modifier_groups g ON g.id=pmg.modifier_group_id "
+            "WHERE pmg.product_id=? ORDER BY pmg.sort_order,g.id",
+            (product["id"],))]
         out.append(product)
     return {"products": out}
 
@@ -1514,6 +1520,37 @@ def h_catalog_product_update(args, body, conn):
                         (product_id, variant["name"], variant["price_cents"],
                          variant["stock_qty"], variant["is_default"],
                          variant["sort_order"], variant["active"]))
+        if "modifier_groups" in body:
+            attachments = body["modifier_groups"]
+            if not isinstance(attachments, list):
+                raise ApiError(400, "Invalid modifier groups")
+            conn.execute("DELETE FROM product_modifier_groups WHERE product_id=?",
+                         (product_id,))
+            for attachment in attachments:
+                if not isinstance(attachment, dict):
+                    raise ApiError(400, "Invalid modifier group attachment")
+                group_id = int(attachment["modifier_group_id"])
+                group = conn.execute(
+                    "SELECT * FROM modifier_groups WHERE id=? AND branch_id=?",
+                    (group_id, branch_id)).fetchone()
+                if not group:
+                    raise ApiError(404, "Modifier group not found")
+                override_min = attachment.get("override_min")
+                override_max = attachment.get("override_max")
+                if override_min is not None:
+                    override_min = int(override_min)
+                if override_max is not None:
+                    override_max = int(override_max)
+                min_select = override_min if override_min is not None else group["min_select"]
+                max_select = override_max if override_max is not None else group["max_select"]
+                if min_select < 0 or max_select < min_select:
+                    raise ApiError(400, "Invalid modifier group bounds")
+                conn.execute(
+                    "INSERT INTO product_modifier_groups"
+                    "(product_id,modifier_group_id,sort_order,override_min,override_max)"
+                    " VALUES(?,?,?,?,?)",
+                    (product_id, group_id, int(attachment.get("sort_order", 0)),
+                     override_min, override_max))
         bump_rev(conn)
         conn.commit()
     except Exception:
@@ -2394,6 +2431,39 @@ def h_item_image(args, body, conn):
     bump_rev(conn); conn.commit()
     return {"ok": True, "image_url": image_url}
 
+def h_product_image(args, body, conn):
+    branch_id = get_branch_id(body)
+    product_id = int(args[0])
+    require_product(conn, product_id, branch_id)
+    mime_types = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
+    extension = mime_types.get(body.get("mime"))
+    if not extension:
+        raise ApiError(400, "Upload PNG, JPEG, or WebP images")
+    try:
+        image = base64.b64decode(body.get("data") or "", validate=True)
+    except (ValueError, TypeError):
+        raise ApiError(400, "Invalid image data")
+    if not image or len(image) > 2_000_000:
+        raise ApiError(413, "Image must be between 1 byte and 2 MB")
+    valid_signature = (
+        (extension == "png" and image.startswith(b"\x89PNG\r\n\x1a\n")) or
+        (extension == "jpg" and image.startswith(b"\xff\xd8\xff")) or
+        (extension == "webp" and len(image) >= 12 and image[:4] == b"RIFF" and image[8:12] == b"WEBP")
+    )
+    if not valid_signature:
+        raise ApiError(400, "Image content does not match its format")
+    os.makedirs(IMAGES_DIR, exist_ok=True)
+    filename = "%s.%s" % (uuid.uuid4().hex, extension)
+    path = os.path.join(IMAGES_DIR, filename)
+    with open(path, "wb") as image_file:
+        image_file.write(image)
+    image_url = "/item-images/" + filename
+    conn.execute("UPDATE products SET image_path=? WHERE id=?",
+                 (image_url, product_id))
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True, "image_url": image_url}
+
 def h_settings(args, body, conn):
     global CONFIG
     allowed = ("restaurant_name", "currency", "printer_ip", "printer_port", "autoprint", "admin_pin", "port",
@@ -2492,6 +2562,7 @@ ROUTES = [
     ("PUT",    r"^/api/orders/(\d+)/bill$",         h_bill_request,   False),
     ("GET",    r"^/api/sales$",                     h_sales,          True),
     ("PUT",    r"^/api/items/(\d+)/image$",         h_item_image,     True),
+    ("PUT",    r"^/api/products/(\d+)/image$",      h_product_image,  True),
 ]
 
 # ---------------------------------------------------------------- HTTP server

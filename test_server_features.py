@@ -173,6 +173,50 @@ class RestaurantFeatureTests(unittest.TestCase):
             server.h_items_legacy_write([], {"branch_id": 1}, self.conn)
         self.assertEqual(error.exception.code, 405)
 
+    def test_catalog_product_patch_atomic_and_image(self):
+        section = self.conn.execute("SELECT id FROM sections LIMIT 1").fetchone()
+        product = server.h_catalog_product_create([], {
+            "branch_id": 1,
+            "section_id": section["id"],
+            "name": "Atomic Pizza",
+            "variants": [{
+                "name": "Regular", "price_cents": 1000,
+                "stock_qty": 10, "is_default": 1, "active": 1,
+            }],
+        }, self.conn)
+        product_id = product["product_id"]
+        server.h_catalog_product_update([str(product_id)], {
+            "branch_id": 1,
+            "variants": [{
+                "name": "Large", "price_cents": 1500,
+                "stock_qty": 8, "is_default": 1, "active": 1,
+            }],
+        }, self.conn)
+        count = self.conn.execute(
+            "SELECT COUNT(*) FROM product_variants WHERE product_id=?",
+            (product_id,)).fetchone()[0]
+        self.assertEqual(count, 1)
+        row = self.conn.execute(
+            "SELECT name,price_cents FROM product_variants WHERE product_id=?",
+            (product_id,)).fetchone()
+        self.assertEqual(tuple(row), ("Large", 1500))
+        with self.assertRaises(server.ApiError):
+            server.h_catalog_product_update([str(product_id)], {
+                "branch_id": 1,
+                "variants": [],
+            }, self.conn)
+        image = base64.b64encode(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+            b"\x00\x00\x00\x01\x08\x06\x00\x00\x00").decode("ascii")
+        uploaded = server.h_product_image([str(product_id)], {
+            "branch_id": 1, "mime": "image/png", "data": image,
+        }, self.conn)
+        filename = os.path.basename(uploaded["image_url"])
+        self.assertTrue(os.path.isfile(os.path.join(server.IMAGES_DIR, filename)))
+        saved = self.conn.execute(
+            "SELECT image_path FROM products WHERE id=?", (product_id,)).fetchone()
+        self.assertEqual(saved["image_path"], uploaded["image_url"])
+
     def test_catalog_historical_price_and_variant_cancel_stock(self):
         section = self.conn.execute("SELECT id FROM sections LIMIT 1").fetchone()
         product = server.h_catalog_product_create([], {

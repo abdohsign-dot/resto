@@ -275,24 +275,24 @@ Deferred to Phase 7:
 - merge/consolidation tools
 
 ### 4.1 Sections pane
-[ ] list sections
-[ ] create / rename / hide / soft-delete
-[ ] reorder (buttons for now, drag-and-drop later)
+[x] list sections
+[x] create / rename / hide / soft-delete
+[x] reorder (buttons for now, drag-and-drop later)
 
 ### 4.2 Products pane
-[ ] list products for selected section
-[ ] search (client-side filter over loaded list is fine)
-[ ] create product (opens editor with one empty variant)
-[ ] edit product
-[ ] soft-delete product
+[x] list products for selected section
+[x] search (client-side filter over loaded list is fine)
+[x] create product (opens editor with one default Regular variant)
+[x] edit product
+[x] soft-delete product
 
 ### 4.3 Product editor
-[ ] name, description, image upload
-[ ] variants table: add row, edit name/price/stock, set default, delete (block last)
-[ ] attach one modifier group (checkbox list)
-[ ] per-product override_min / override_max (NULL = inherit)
-[ ] Save is atomic: one POST/PATCH with everything
-[ ] Show server validation errors inline, not as a generic toast
+[x] name, description, image upload
+[x] variants table: add row, edit name/price/stock, set default, delete (block last)
+[x] attach one modifier group (checkbox list)
+[x] per-product override_min / override_max (NULL = inherit)
+[x] Save is atomic: one POST/PATCH with everything
+[x] Show server validation errors inline, not as a generic toast
 
 ### 4.4 Tests for Phase 4
 [ ] browser walkthrough: create section, product, 3 variants, attach group, save
