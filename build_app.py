@@ -3,6 +3,7 @@
 """Build app.html: inline the src/ parts (css + js) into one self-contained file."""
 import argparse
 import os
+import tempfile
 
 SRC = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(SRC, "app.html")
@@ -38,10 +39,14 @@ if "</script" in js.lower():
 html = top + "<style>\n" + css + "</style>\n" + mid + "<script>\n" + js + "</script>\n</body>\n</html>\n"
 
 if args.check:
-    with open(OUT, "r", encoding="utf-8") as f:
-        current = f.read()
-    if current != html:
-        raise SystemExit("ERROR: app.html is stale or was edited directly; run build_app.py")
+    with tempfile.TemporaryDirectory(prefix="resto-build-check-") as temp_dir:
+        generated = os.path.join(temp_dir, "app.html")
+        with open(generated, "w", encoding="utf-8", newline="\n") as f:
+            f.write(html)
+        with open(OUT, "rb") as current_file, open(generated, "rb") as generated_file:
+            if current_file.read() != generated_file.read():
+                raise SystemExit(
+                    "ERROR: app.html is stale or was edited directly; run build_app.py")
     print("app.html is up to date")
     raise SystemExit(0)
 

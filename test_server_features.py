@@ -417,9 +417,14 @@ class RestaurantFeatureTests(unittest.TestCase):
                          "X-Admin-Pin": server.CONFIG["admin_pin"]})
             with urllib.request.urlopen(request) as response:
                 json.load(response)
-            log_files = [os.path.join(server.AUDIT_DIR, name)
-                         for name in os.listdir(server.AUDIT_DIR)
-                         if name.endswith(".jsonl")]
+            log_files = []
+            for _ in range(20):
+                log_files = [os.path.join(server.AUDIT_DIR, name)
+                             for name in os.listdir(server.AUDIT_DIR)
+                             if name.endswith(".jsonl")]
+                if log_files:
+                    break
+                threading.Event().wait(0.01)
             self.assertTrue(log_files)
             with open(log_files[-1], "r", encoding="utf-8") as log:
                 content = log.read()

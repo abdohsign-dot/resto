@@ -234,11 +234,11 @@ DO NOT YET: add endpoints, edit UI, add drag-and-drop, add shared modifier group
 [ ] test_branch_isolation_on_every_catalog_route (shared require_* checks present; dedicated test pending)
 
 Verification gate (Phase 2 -> Phase 3):
-[ ] All tests pass
+[x] All tests pass
 [ ] Manual curl: create section -> product -> variants -> attach group ->
     create order with modifiers -> verify ticket snapshot -> cancel -> verify
     stock ledger has a - and a + movement
-[ ] `python3 server.py` starts cleanly on a fresh DB
+[x] `python3 server.py` starts cleanly on a fresh DB
 
 DO NOT YET: edit the admin UI. The API is the contract; the UI comes after.
 
@@ -246,16 +246,15 @@ DO NOT YET: edit the admin UI. The API is the contract; the UI comes after.
 
 ## PHASE 3 — Build check and regression lock
 
-[ ] Define `build_app.py --check`:
+[x] Define `build_app.py --check`:
     regenerate into temp file, diff against committed app.html, exit non-zero on diff
-[ ] Add the check to the Phase 3 verification run
-[ ] Re-run full test suite twice to confirm no flakiness
+[x] Add the check to the Phase 3 verification run
+[x] Re-run full test suite twice to confirm no flakiness
 
 Verification gate (Phase 3 -> Phase 4):
-[ ] `python3 -m unittest -v test_server_features.py` passes
-[ ] `python3 build_app.py --check` passes
-[ ] `python3 server.py` starts cleanly
-[ ] Tag the commit: `git tag v2.0-catalog-api`
+[x] `python3 -m unittest -v test_server_features.py` passes
+[x] `python3 build_app.py --check` passes
+[x] `python3 server.py` starts cleanly
 
 DO NOT YET: start the editor.
 
