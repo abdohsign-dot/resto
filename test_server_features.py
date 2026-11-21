@@ -54,6 +54,22 @@ class RestaurantFeatureTests(unittest.TestCase):
                              "Legacy section")
             item = migrated.execute("SELECT name,branch_id,stock_qty,modifiers FROM items WHERE id=1").fetchone()
             self.assertEqual(tuple(item), ("Legacy dish", 1, None, "[]"))
+            product = migrated.execute(
+                "SELECT p.id,p.name,p.section_id,v.name,v.price_cents,"
+                "v.stock_qty,v.is_default "
+                "FROM products p JOIN product_variants v ON v.product_id=p.id "
+                "JOIN catalog_migration_items m ON m.product_id=p.id "
+                "WHERE m.item_id=1").fetchone()
+            self.assertEqual(tuple(product),
+                             (product["id"], "Legacy dish", 1, "Regular",
+                              1250, None, 1))
+            server.init_db()
+            migrated.close()
+            migrated = server.db()
+            self.assertEqual(
+                migrated.execute("SELECT COUNT(*) FROM products").fetchone()[0], 1)
+            self.assertEqual(
+                migrated.execute("SELECT COUNT(*) FROM product_variants").fetchone()[0], 1)
             migrated.close()
         finally:
             server.DATA_DIR, server.DB_PATH, server.TICKETS_DIR, server.IMAGES_DIR = original
@@ -67,6 +83,30 @@ class RestaurantFeatureTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "newer version"):
             server.init_db()
         self.conn = server.db()
+
+    def test_integer_cents_and_default_variant_invariants(self):
+        item = self.conn.execute("SELECT id,price FROM items ORDER BY id LIMIT 1").fetchone()
+        server.h_item_update([str(item["id"])], {
+            "branch_id": 1,
+            "price": 12.34,
+        }, self.conn)
+        variant = self.conn.execute(
+            "SELECT v.price_cents,v.is_default "
+            "FROM product_variants v JOIN catalog_migration_items m "
+            "ON m.variant_id=v.id WHERE m.item_id=?",
+            (item["id"],)).fetchone()
+        self.assertEqual(variant["price_cents"], 1234)
+        self.assertEqual(variant["is_default"], 1)
+        product_id = self.conn.execute(
+            "SELECT product_id FROM catalog_migration_items WHERE item_id=?",
+            (item["id"],)).fetchone()["product_id"]
+        variant_id = self.conn.execute(
+            "SELECT variant_id FROM catalog_migration_items WHERE item_id=?",
+            (item["id"],)).fetchone()["variant_id"]
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "UPDATE product_variants SET is_default=0 WHERE id=?",
+                (variant_id,))
 
     def test_branch_copy_is_isolated(self):
         source = server.h_state([], {"branch_id": 1}, self.conn)
@@ -90,6 +130,14 @@ class RestaurantFeatureTests(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT stock_qty FROM items WHERE id=?", (item["id"],)).fetchone()[0], 0)
         loaded = server.get_order(self.conn, order["order_id"])
         self.assertEqual(loaded["total"], round((item["price"] + 1.5) * 2, 2))
+        mapping = self.conn.execute(
+            "SELECT variant_id FROM catalog_migration_items WHERE item_id=?",
+            (item["id"],)).fetchone()
+        accept_movement = self.conn.execute(
+            "SELECT delta,reason FROM stock_movements "
+            "WHERE variant_id=? AND reason='order_accept'",
+            (mapping["variant_id"],)).fetchone()
+        self.assertEqual(tuple(accept_movement), (-2, "order_accept"))
         server.h_line_status([str(order["order_id"]), str(loaded["lines"][0]["id"])],
                              {"branch_id": 1, "status": "cancelled"}, self.conn)
         self.assertEqual(self.conn.execute("SELECT stock_qty FROM items WHERE id=?", (item["id"],)).fetchone()[0], 2)
@@ -204,12 +252,12 @@ class RestaurantFeatureTests(unittest.TestCase):
         self.assertIn("match", error.exception.msg)
 
     def test_audit_log_allowlist_excludes_guest_name(self):
+        server.AUDIT_DIR = os.path.join(self.temp.name, "logs")
+        os.makedirs(server.AUDIT_DIR, exist_ok=True)
         httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
         base_url = "http://127.0.0.1:%d" % httpd.server_address[1]
-        server.AUDIT_DIR = os.path.join(self.temp.name, "logs")
-        os.makedirs(server.AUDIT_DIR, exist_ok=True)
         try:
             payload = json.dumps({
                 "branch_id": 1, "guest_name": "Sensitive Audit Guest",

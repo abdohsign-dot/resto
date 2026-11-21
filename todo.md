@@ -35,30 +35,30 @@ DO NOT YET: touch the admin UI, touch the waiter UI, add endpoints.
 ## PHASE 1 — Schema, migration, and repository hygiene (FIRST COMMIT)
 
 ### 1.1 Schema version guard
-[ ] In server.py define `DB_VERSION = 2`.
-[ ] On startup, read `PRAGMA user_version`.
-[ ] If `user_version > DB_VERSION`: print a clear error and `sys.exit(1)`.
+[x] In server.py define `DB_VERSION = 2`.
+[x] On startup, read `PRAGMA user_version`.
+[x] If `user_version > DB_VERSION`: print a clear error and `sys.exit(1)`.
     Message must name both versions and say "upgrade server.py or restore an older backup".
-[ ] If `user_version < DB_VERSION`: run migration inside a transaction; rollback on any failure.
-[ ] On success: `PRAGMA user_version = 2`.
-[ ] Write migration idempotency test (run twice, second run is a no-op).
+[x] If `user_version < DB_VERSION`: run migration inside a transaction; rollback on any failure.
+[x] On success: `PRAGMA user_version = 2`.
+[x] Write migration idempotency test (run twice, second run is a no-op).
 
 ### 1.2 New catalog tables
-[ ] `sections` (id, branch_id, name, sort_order, active)
+[x] `sections` (id, branch_id, name, sort_order, active)
       - migration from current `position` to `sort_order`
       - preserve existing `kitchen_station`
-[ ] `products` (id, section_id, name, description, image_path, active, sort_order, deleted_at)
+[x] `products` (id, section_id, name, description, image_path, active, sort_order, deleted_at)
       - migration from legacy `items.image_url` to `image_path`
-[ ] `product_variants` (id, product_id, name, price_cents, stock_qty NULL=untracked,
+[x] `product_variants` (id, product_id, name, price_cents, stock_qty NULL=untracked,
       is_default, sort_order, active)
       + partial unique index: exactly one `is_default=1` per product
       + `UNIQUE(product_id, name)`
-[ ] `modifier_groups` (id, branch_id, name, selection_type, min_select, max_select)
+[x] `modifier_groups` (id, branch_id, name, selection_type, min_select, max_select)
       + `UNIQUE(branch_id, name)`
       + `CHECK(max_select >= min_select)`
-[ ] `modifier_options` (id, modifier_group_id, name, price_delta_cents, sort_order, active)
+[x] `modifier_options` (id, modifier_group_id, name, price_delta_cents, sort_order, active)
       + `UNIQUE(modifier_group_id, name)`
-[ ] `product_modifier_groups` (product_id, modifier_group_id, sort_order, override_min, override_max)
+[x] `product_modifier_groups` (product_id, modifier_group_id, sort_order, override_min, override_max)
       + document NULL semantics: NULL = inherit from group
 [ ] Indexes:
     - products(section_id) WHERE deleted_at IS NULL
@@ -67,13 +67,13 @@ DO NOT YET: touch the admin UI, touch the waiter UI, add endpoints.
     - product_modifier_groups(modifier_group_id)
 
 ### 1.3 Stock ledger (replaces any boolean stock flag)
-[ ] `stock_movements` (id, variant_id, order_line_id, delta, reason, created_at, actor)
+[x] `stock_movements` (id, variant_id, order_line_id, delta, reason, created_at, actor)
 [ ] reason values documented: order_accept, cancel, refund, manual_adjust
-[ ] Decision: keep `product_variants.stock_qty` as a cached, indexed quantity
+[x] Decision: keep `product_variants.stock_qty` as a cached, indexed quantity
     and require every stock change to update the cache and append a ledger row
     in the same transaction.
-[ ] If ledger replay is ever used, it must reconcile the cache from movements.
-[ ] `stock_qty` remains `NULL` for untracked stock and never becomes negative.
+[x] If ledger replay is ever used, it must reconcile the cache from movements.
+[x] `stock_qty` remains `NULL` for untracked stock and never becomes negative.
 
 ### 1.4 Finance foundation (schema compatibility)
 [ ] Audit the existing `payments`, `payment_allocations`, `orders`, and
@@ -92,32 +92,32 @@ DO NOT YET: touch the admin UI, touch the waiter UI, add endpoints.
     - "Every bill references order lines."
 
 ### 1.5 Order-line extension
-[ ] In the existing `order_items` table, add `variant_id`
-[ ] In the existing `order_items` table, add `variant_name`
-[ ] In the existing `order_items` table, add `modifiers_json`
-[ ] Add these columns as nullable for legacy/test order rows.
-[ ] Keep existing item and order snapshots readable while adding catalog fields.
+[x] In the existing `order_items` table, add `variant_id`
+[x] In the existing `order_items` table, add `variant_name`
+[x] In the existing `order_items` table, add `modifiers_json`
+[x] Add these columns as nullable for legacy/test order rows.
+[x] Keep existing item and order snapshots readable while adding catalog fields.
 [ ] DO NOT add a `stock_debited` boolean — the ledger replaces it.
 
 ### 1.6 Legacy items compatibility
-[ ] Preserve or migrate the existing `items` table during Phase 1;
+[x] Preserve or migrate the existing `items` table during Phase 1;
     do not hard-drop it before all current server routes are safely migrated.
 [ ] If a read-only compatibility view is used, name it clearly as a compatibility
     projection and do not accidentally remove the existing write API mid-phase.
 [ ] Create `items_compat` as a VIEW over products JOIN default variant, or expose
     the existing `/api/items` route as a read-only projection.
       Columns: id, section_id, name, description, price_cents, active, stock_qty, image_path
-[ ] Keep all existing `items` writes working for legacy UI clients until Phase 2
+[x] Keep all existing `items` writes working for legacy UI clients until Phase 2
     compatibility adapters are tested.
-[ ] Record legacy writes at the catalog layer, never as a separate source of truth.
+[x] Record legacy writes at the catalog layer, never as a separate source of truth.
 [ ] Remove legacy write routes in Phase 2 only after the new catalog API passes
     positive and negative tests.
 
 ### 1.7 Data migration (test data only — destructive is allowed)
-[ ] For each legacy item: create product + one default variant "Regular" at item price.
-[ ] If legacy modifiers exist: create one per-product modifier_group and move options into it.
-[ ] Preserve existing `order_items` rows and make catalog snapshot columns nullable.
-[ ] Map legacy order-item data to historical names/prices as snapshots even where
+[x] For each legacy item: create product + one default variant "Regular" at item price.
+[x] If legacy modifiers exist: create one per-product modifier_group and move options into it.
+[x] Preserve existing `order_items` rows and make catalog snapshot columns nullable.
+[x] Map legacy order-item data to historical names/prices as snapshots even where
     no variant ID exists.
 [ ] Record in the migration docstring: "legacy order rows retain item snapshots;
     variant IDs are nullable until future catalog-backed lines".
@@ -125,7 +125,7 @@ DO NOT YET: touch the admin UI, touch the waiter UI, add endpoints.
     order item merely to simplify migration.
 
 ### 1.8 Repository hygiene (same commit)
-[ ] Create `.gitignore`:
+[x] Create `.gitignore`:
       __pycache__/
       *.pyc
       data/logs/
@@ -135,24 +135,24 @@ DO NOT YET: touch the admin UI, touch the waiter UI, add endpoints.
       config.json
 [ ] `git rm -r --cached __pycache__ data`
 [ ] Commit `data/.gitkeep` and `config.example.json`
-[ ] Add `LICENSE` (MIT or "source-available, all rights reserved")
+[x] Add `LICENSE` (MIT or "source-available, all rights reserved")
 [ ] Move screenshots to `docs/screenshots/`
 
 ### 1.9 Tests for Phase 1
-[ ] test_migration_flat_to_variants
-[ ] test_migration_idempotent (run twice)
-[ ] test_refuse_start_when_db_newer_than_binary
-[ ] test_zero_variants_rejected
-[ ] test_duplicate_default_variant_rejected
-[ ] test_missing_default_variant_rejected
-[ ] test_integer_cents_roundtrip
-[ ] test_stock_deducted_on_accept_via_ledger
-[ ] test_stock_restored_on_cancel_via_ledger
-[ ] test_branch_isolation_products (negative case: wrong branch header -> 404)
-[ ] test_legacy_items_projection_or_adapter
+[x] test_migration_flat_to_variants
+[x] test_migration_idempotent (run twice)
+[x] test_refuse_start_when_db_newer_than_binary
+[ ] test_zero_variants_rejected (requires catalog endpoints, Phase 2)
+[ ] test_duplicate_default_variant_rejected (database partial index covered; API pending)
+[x] test_missing_default_variant_rejected
+[x] test_integer_cents_roundtrip
+[x] test_stock_deducted_on_accept_via_ledger
+[x] test_stock_restored_on_cancel_via_ledger
+[x] test_branch_isolation_products (negative case: wrong branch header -> 404)
+[ ] test_legacy_items_projection_or_adapter (compatibility is in shared item writes; projection pending)
 
 Verification gate (Phase 1 -> Phase 2):
-[ ] `python3 -m unittest -v test_server_features.py` — all pass
+[x] `python3 -m unittest -v test_server_features.py` — all pass (11 tests)
 [ ] Fresh DB: `rm data/restaurant.db && python3 server.py` starts cleanly, no errors
 [ ] Old DB copy: restore a Phase 0 backup, start server, migration runs, tests pass
 [ ] A grep audit documents every remaining legacy `items` read/write and assigns

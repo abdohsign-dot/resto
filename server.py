@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
     "ticket_red_minutes": 10,
 }
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # ---------------------------------------------------------------- config / db
 
@@ -153,6 +153,105 @@ CREATE TABLE IF NOT EXISTS branches (
     name TEXT NOT NULL UNIQUE,
     active INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    section_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    image_path TEXT DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    deleted_at TEXT
+);
+CREATE TABLE IF NOT EXISTS product_variants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    price_cents INTEGER NOT NULL CHECK (price_cents >= 0),
+    stock_qty INTEGER CHECK (stock_qty IS NULL OR stock_qty >= 0),
+    is_default INTEGER NOT NULL DEFAULT 0,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(product_id, name),
+    FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_default_variant
+    ON product_variants(product_id) WHERE is_default=1;
+CREATE TRIGGER IF NOT EXISTS tr_variant_default_insert
+AFTER INSERT ON product_variants
+BEGIN
+    SELECT CASE WHEN
+        (SELECT COUNT(*) FROM product_variants
+         WHERE product_id=NEW.product_id AND is_default=1) != 1
+    THEN RAISE(ABORT, 'product requires exactly one default variant')
+    END;
+END;
+CREATE TRIGGER IF NOT EXISTS tr_variant_default_update
+AFTER UPDATE OF is_default ON product_variants
+BEGIN
+    SELECT CASE WHEN
+        (SELECT COUNT(*) FROM product_variants
+         WHERE product_id=NEW.product_id AND is_default=1) != 1
+    THEN RAISE(ABORT, 'product requires exactly one default variant')
+    END;
+END;
+CREATE INDEX IF NOT EXISTS ix_products_section
+    ON products(section_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS ix_variants_product
+    ON product_variants(product_id);
+
+CREATE TABLE IF NOT EXISTS modifier_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    selection_type TEXT NOT NULL CHECK (selection_type IN ('single','multi')),
+    min_select INTEGER NOT NULL DEFAULT 0,
+    max_select INTEGER NOT NULL DEFAULT 1,
+    CHECK (max_select >= min_select),
+    UNIQUE(branch_id, name)
+);
+CREATE TABLE IF NOT EXISTS modifier_options (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    modifier_group_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    price_delta_cents INTEGER NOT NULL DEFAULT 0,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(modifier_group_id, name),
+    FOREIGN KEY(modifier_group_id) REFERENCES modifier_groups(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS product_modifier_groups (
+    product_id INTEGER NOT NULL,
+    modifier_group_id INTEGER NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    override_min INTEGER,
+    override_max INTEGER,
+    PRIMARY KEY(product_id, modifier_group_id),
+    FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
+    FOREIGN KEY(modifier_group_id) REFERENCES modifier_groups(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS ix_options_group
+    ON modifier_options(modifier_group_id);
+CREATE INDEX IF NOT EXISTS ix_product_modifier_groups_group
+    ON product_modifier_groups(modifier_group_id);
+
+CREATE TABLE IF NOT EXISTS stock_movements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    variant_id INTEGER NOT NULL,
+    order_item_id INTEGER,
+    delta INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    actor TEXT DEFAULT '',
+    FOREIGN KEY(variant_id) REFERENCES product_variants(id)
+);
+CREATE TABLE IF NOT EXISTS catalog_migration_items (
+    item_id INTEGER PRIMARY KEY,
+    product_id INTEGER NOT NULL,
+    variant_id INTEGER NOT NULL,
+    FOREIGN KEY(product_id) REFERENCES products(id),
+    FOREIGN KEY(variant_id) REFERENCES product_variants(id)
+);
 CREATE TABLE IF NOT EXISTS reservations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     branch_id INTEGER NOT NULL DEFAULT 1,
@@ -210,7 +309,10 @@ def init_db():
                    "bill_requested": "INTEGER NOT NULL DEFAULT 0",
                    "lang": "TEXT NOT NULL DEFAULT 'fr'"},
         "order_items": {"modifiers": "TEXT NOT NULL DEFAULT '[]'",
-                        "stock_debited": "INTEGER NOT NULL DEFAULT 0"},
+                        "stock_debited": "INTEGER NOT NULL DEFAULT 0",
+                        "variant_id": "INTEGER",
+                        "variant_name": "TEXT",
+                        "modifiers_json": "TEXT"},
         "payments": {"refunded_amount": "REAL NOT NULL DEFAULT 0"},
     }
     for table, columns in migrations.items():
@@ -224,6 +326,8 @@ def init_db():
     if row is None:
         conn.execute("INSERT INTO meta(key, value) VALUES('rev','1')")
         seed(conn)
+    if db_version < SCHEMA_VERSION:
+        migrate_catalog_v2(conn)
     conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
     conn.commit()
     conn.close()
@@ -250,6 +354,134 @@ def seed(conn):
     for name, tables in [("Alex", list(range(1, 9))), ("Maria", list(range(9, 17)))]:
         conn.execute("INSERT INTO staff(name, tables, active) VALUES(?,?,1)",
                      (name, json.dumps(tables)))
+
+def parse_legacy_modifiers(raw):
+    """Parse JSON modifiers or legacy 'Name:price' text for catalog migration."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = []
+            for line in text.splitlines():
+                if ":" not in line:
+                    continue
+                name, price = line.rsplit(":", 1)
+                try:
+                    parsed.append({"name": name.strip(), "price": float(price.strip())})
+                except (TypeError, ValueError):
+                    continue
+        raw = parsed
+    if not isinstance(raw, list):
+        return []
+    out = []
+    seen = set()
+    for modifier in raw:
+        if not isinstance(modifier, dict):
+            continue
+        name = str(modifier.get("name") or "").strip()
+        try:
+            price = round(float(modifier.get("price", 0)), 2)
+        except (TypeError, ValueError):
+            continue
+        if not name or name in seen or not math.isfinite(price) or price < 0:
+            continue
+        seen.add(name)
+        out.append({"name": name, "price": price})
+    return out
+
+def migrate_catalog_v2(conn):
+    """Create catalog rows for legacy items and map each item directly by ID."""
+    for item in conn.execute("SELECT * FROM items").fetchall():
+        existing = conn.execute(
+            "SELECT 1 FROM catalog_migration_items WHERE item_id=?",
+            (item["id"],)).fetchone()
+        if existing:
+            continue
+        section_id = item["section_id"]
+        price = round(float(item["price"]), 2)
+        if not math.isfinite(price) or price < 0:
+            price = 0.0
+        price_cents = int(round(price * 100))
+        columns = set(item.keys())
+        stock = item["stock_qty"] if "stock_qty" in columns else None
+        active = int(bool(item["active"])) if "active" in columns else 1
+        sort_order = int(item["position"]) if "position" in columns else 0
+        description = str(item["description"] or "") if "description" in columns else ""
+        image_path = str(item["image_url"] or "") if "image_url" in columns else ""
+
+        product = conn.execute(
+            "INSERT INTO products(section_id,name,description,image_path,active,sort_order)"
+            " VALUES(?,?,?,?,?,?)",
+            (section_id, str(item["name"]), description, image_path,
+             active, sort_order))
+        product_id = product.lastrowid
+        variant = conn.execute(
+            "INSERT INTO product_variants"
+            "(product_id,name,price_cents,stock_qty,is_default,sort_order,active)"
+            " VALUES(?,?,?,?,1,0,?)",
+            (product_id, "Regular", price_cents, stock, active))
+        variant_id = variant.lastrowid
+        conn.execute(
+            "INSERT INTO catalog_migration_items(item_id,product_id,variant_id)"
+            " VALUES(?,?,?)",
+            (item["id"], product_id, variant_id))
+        if stock is not None:
+            conn.execute(
+                "INSERT INTO stock_movements"
+                "(variant_id,delta,reason,created_at,actor)"
+                " VALUES(?,?,'manual_adjust',?,?)",
+                (variant_id, int(stock), time.time(), "migration"))
+
+        modifiers = parse_legacy_modifiers(
+            item["modifiers"] if "modifiers" in columns else None)
+        if modifiers:
+            branch_row = conn.execute(
+                "SELECT branch_id FROM sections WHERE id=?", (section_id,)).fetchone()
+            branch_id = int(branch_row["branch_id"]) if branch_row else 1
+            group_name = "%s extras" % str(item["name"])
+            existing_group = conn.execute(
+                "SELECT id FROM modifier_groups WHERE branch_id=? AND name=?",
+                (branch_id, group_name)).fetchone()
+            if existing_group:
+                group_id = existing_group["id"]
+            else:
+                group = conn.execute(
+                    "INSERT INTO modifier_groups"
+                    "(branch_id,name,selection_type,min_select,max_select)"
+                    " VALUES(?,?,'multi',0,999)",
+                    (branch_id, group_name))
+                group_id = group.lastrowid
+            for index, modifier in enumerate(modifiers):
+                conn.execute(
+                    "INSERT OR IGNORE INTO modifier_options"
+                    "(modifier_group_id,name,price_delta_cents,sort_order,active)"
+                    " VALUES(?,?,?,?,1)",
+                    (group_id, modifier["name"], int(round(modifier["price"] * 100)), index))
+            conn.execute(
+                "INSERT OR IGNORE INTO product_modifier_groups"
+                "(product_id,modifier_group_id,sort_order,override_min,override_max)"
+                " VALUES(?,?,0,NULL,NULL)",
+                (product_id, group_id))
+
+    for line in conn.execute(
+            "SELECT oi.id,oi.item_id,oi.modifiers "
+            "FROM order_items oi "
+            "JOIN catalog_migration_items mi ON mi.item_id=oi.item_id "
+            "WHERE oi.variant_id IS NULL").fetchall():
+        mapping = conn.execute(
+            "SELECT variant_id FROM catalog_migration_items WHERE item_id=?",
+            (line["item_id"],)).fetchone()
+        if not mapping:
+            continue
+        conn.execute(
+            "UPDATE order_items SET variant_id=?, variant_name='Regular', "
+            "modifiers_json=? WHERE id=?",
+            (mapping["variant_id"], line["modifiers"] or "[]", line["id"]))
 
 def bump_rev(conn):
     conn.execute("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key='rev'")
@@ -334,7 +566,8 @@ def require_branch(conn, branch_id):
         raise ApiError(404, "Branch not found")
 
 def restore_stock(conn, order_id, line_id=None):
-    sql = ("SELECT oi.id, oi.item_id, oi.qty, oi.stock_debited FROM order_items oi "
+    sql = ("SELECT oi.id, oi.item_id, oi.variant_id, oi.qty, oi.stock_debited "
+           "FROM order_items oi "
            "WHERE oi.order_id=? AND oi.stock_debited=1")
     params = [order_id]
     if line_id is not None:
@@ -343,6 +576,17 @@ def restore_stock(conn, order_id, line_id=None):
     for row in conn.execute(sql, params).fetchall():
         conn.execute("UPDATE items SET stock_qty=stock_qty+? WHERE id=? AND stock_qty IS NOT NULL",
                      (row["qty"], row["item_id"]))
+        if row["variant_id"] is not None:
+            conn.execute(
+                "UPDATE product_variants SET stock_qty=stock_qty+? "
+                "WHERE id=? AND stock_qty IS NOT NULL",
+                (row["qty"], row["variant_id"]))
+            conn.execute(
+                "INSERT INTO stock_movements"
+                "(variant_id,order_item_id,delta,reason,created_at,actor)"
+                " VALUES(?,?,?,'cancel',?,?)",
+                (row["variant_id"], row["id"], int(row["qty"]),
+                 time.time(), "system"))
         conn.execute("UPDATE order_items SET stock_debited=0 WHERE id=?", (row["id"],))
 
 def parse_modifiers(raw):
@@ -671,7 +915,18 @@ def h_order_create(args, body, conn):
                           (l.get("item_id"), branch_id)).fetchone()
         if not it:
             continue
-        if it["stock_qty"] is not None and it["stock_qty"] < qty:
+        mapping = conn.execute(
+            "SELECT variant_id FROM catalog_migration_items WHERE item_id=?",
+            (it["id"],)).fetchone()
+        variant_id = mapping["variant_id"] if mapping else None
+        if variant_id is not None:
+            variant = conn.execute(
+                "SELECT stock_qty FROM product_variants WHERE id=?",
+                (variant_id,)).fetchone()
+            available = variant["stock_qty"] if variant else None
+        else:
+            available = it["stock_qty"]
+        if available is not None and available < qty:
             conn.rollback()
             raise ApiError(409, "%s is out of stock" % it["name"])
         allowed_modifiers = json.loads(it["modifiers"] or "[]")
@@ -685,15 +940,35 @@ def h_order_create(args, body, conn):
             conn.rollback()
             raise ApiError(400, "Unknown item modifier")
         unit_price = round(it["price"] + sum(m["price"] for m in actual_modifiers), 2)
-        stock_debited = int(it["stock_qty"] is not None)
+        stock_debited = int(available is not None)
         if stock_debited:
             conn.execute("UPDATE items SET stock_qty=stock_qty-? WHERE id=? AND branch_id=?",
                          (qty, it["id"], branch_id))
-        conn.execute(
+        if variant_id is not None and available is not None:
+            variant_update = conn.execute(
+                "UPDATE product_variants SET stock_qty=stock_qty-? "
+                "WHERE id=? AND stock_qty IS NOT NULL AND stock_qty>=?",
+                (qty, variant_id, qty))
+            if variant_update.rowcount != 1:
+                conn.rollback()
+                raise ApiError(409, "%s is out of stock" % it["name"])
+        line = conn.execute(
             "INSERT INTO order_items(order_id, item_id, name, price, qty, note, status, modifiers, stock_debited) "
             "VALUES(?,?,?,?,?,?, 'sent',?,?)",
             (order_id, it["id"], it["name"], unit_price, qty, str(l.get("note") or "")[:200],
              json.dumps(actual_modifiers, ensure_ascii=False), stock_debited))
+        if variant_id is not None:
+            conn.execute(
+                "UPDATE order_items SET variant_id=?, variant_name='Regular', "
+                "modifiers_json=? WHERE id=?",
+                (variant_id, json.dumps(actual_modifiers, ensure_ascii=False),
+                 line.lastrowid))
+            if available is not None:
+                conn.execute(
+                    "INSERT INTO stock_movements"
+                    "(variant_id,order_item_id,delta,reason,created_at,actor)"
+                    " VALUES(?,?,?,'order_accept',?,?)",
+                    (variant_id, line.lastrowid, -int(qty), time.time(), "system"))
     n = conn.execute("SELECT COUNT(*) c FROM order_items WHERE order_id=?", (order_id,)).fetchone()["c"]
     if n == 0:
         conn.execute("DELETE FROM orders WHERE id=?", (order_id,))
@@ -816,6 +1091,46 @@ def h_section_delete(args, body, conn):
     bump_rev(conn); conn.commit()
     return {"ok": True}
 
+def sync_catalog_from_item(conn, item_id):
+    item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+    if not item:
+        return
+    mapping = conn.execute(
+        "SELECT product_id,variant_id FROM catalog_migration_items WHERE item_id=?",
+        (item_id,)).fetchone()
+    if mapping:
+        product_id = mapping["product_id"]
+        variant_id = mapping["variant_id"]
+        conn.execute(
+            "UPDATE products SET section_id=?,name=?,description=?,image_path=?,"
+            "active=?,sort_order=? WHERE id=?",
+            (item["section_id"], item["name"], str(item["description"] or ""),
+             str(item["image_url"] or ""), int(bool(item["active"])),
+             int(item["position"]), product_id))
+        conn.execute(
+            "UPDATE product_variants SET name='Regular',price_cents=?,stock_qty=?,"
+            "is_default=1,active=? WHERE id=?",
+            (int(round(float(item["price"]) * 100)),
+             item["stock_qty"], int(bool(item["active"])), variant_id))
+        return
+    product = conn.execute(
+        "INSERT INTO products(section_id,name,description,image_path,active,sort_order)"
+        " VALUES(?,?,?,?,?,?)",
+        (item["section_id"], item["name"], str(item["description"] or ""),
+         str(item["image_url"] or ""), int(bool(item["active"])),
+         int(item["position"])))
+    product_id = product.lastrowid
+    variant = conn.execute(
+        "INSERT INTO product_variants"
+        "(product_id,name,price_cents,stock_qty,is_default,sort_order,active)"
+        " VALUES(?, 'Regular', ?, ?, 1, 0, ?)",
+        (product_id, int(round(float(item["price"]) * 100)),
+         item["stock_qty"], int(bool(item["active"]))))
+    conn.execute(
+        "INSERT INTO catalog_migration_items(item_id,product_id,variant_id)"
+        " VALUES(?,?,?)",
+        (item_id, product_id, variant.lastrowid))
+
 def h_item_create(args, body, conn):
     branch_id = get_branch_id(body)
     require_branch(conn, branch_id)
@@ -852,6 +1167,7 @@ def h_item_create(args, body, conn):
                        "VALUES(?,?,?,?,?,1,?,?,?,?)",
                        (sid, name, price, str(body.get("description") or "")[:300], pos, branch_id,
                         stock, image_url[:500], json.dumps(modifiers, ensure_ascii=False)))
+    sync_catalog_from_item(conn, cur.lastrowid)
     bump_rev(conn); conn.commit()
     return {"ok": True, "item_id": cur.lastrowid}
 
@@ -911,12 +1227,20 @@ def h_item_update(args, body, conn):
         if k in body:
             conn.execute("UPDATE items SET %s=? WHERE id=? AND branch_id=?" % k,
                          (int(body[k]), iid, branch_id))
+    sync_catalog_from_item(conn, iid)
     bump_rev(conn); conn.commit()
     return {"ok": True}
 
 def h_item_delete(args, body, conn):
     branch_id = get_branch_id(body)
-    conn.execute("DELETE FROM items WHERE id=? AND branch_id=?", (int(args[0]), branch_id))
+    iid = int(args[0])
+    mapping = conn.execute(
+        "SELECT product_id FROM catalog_migration_items WHERE item_id=?",
+        (iid,)).fetchone()
+    conn.execute("DELETE FROM items WHERE id=? AND branch_id=?", (iid, branch_id))
+    if mapping:
+        conn.execute("DELETE FROM catalog_migration_items WHERE item_id=?", (iid,))
+        conn.execute("DELETE FROM products WHERE id=?", (mapping["product_id"],))
     bump_rev(conn); conn.commit()
     return {"ok": True}
 
@@ -998,11 +1322,12 @@ def h_branch_create(args, body, conn):
                  section["kitchen_station"] if "kitchen_station" in section.keys() else ""))
             section_map[section["id"]] = new_section.lastrowid
         for item in conn.execute("SELECT * FROM items WHERE branch_id=?", (source_id,)):
-            conn.execute(
+            copied = conn.execute(
                 "INSERT INTO items(section_id,name,price,description,position,active,branch_id,"
                 "stock_qty,image_url,modifiers) VALUES(?,?,?,?,?,?,?,NULL,?,?)",
                 (section_map[item["section_id"]], item["name"], item["price"], item["description"],
                  item["position"], item["active"], new_id, item["image_url"], item["modifiers"]))
+            sync_catalog_from_item(conn, copied.lastrowid)
         for staff in conn.execute("SELECT * FROM staff WHERE branch_id=?", (source_id,)):
             conn.execute(
                 "INSERT INTO staff(name,tables,active,branch_id,role,kitchen_station) VALUES(?,?,?,?,?,?)",
