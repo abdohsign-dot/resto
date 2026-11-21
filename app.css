@@ -244,4 +244,11 @@ dialog::backdrop { background: rgba(2,6,16,.66); }
   .catalog-group-option { grid-template-columns: 22px 1fr; }
   .catalog-group-option .in { width: 100%; }
 }
+  .catalog-variant-picker, .catalog-option-picker { display: grid; gap: 7px; }
+  .catalog-choice { display:flex; align-items:center; gap:8px; min-height:44px; padding:9px 10px;
+    border:1px solid var(--line); border-radius:10px; background:var(--panel2); }
+  .catalog-choice.disabled { opacity:.55; }
+  .catalog-choice .grow { flex:1; }
+  .catalog-qty { display:flex; align-items:center; gap:10px; margin-top:12px; }
+  .catalog-sheet-price { margin-left:auto; color:var(--acc); font-weight:800; }
 .bigprice { font-size: 18px; font-weight: 800; color: var(--acc); }

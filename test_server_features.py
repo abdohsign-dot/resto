@@ -256,6 +256,74 @@ class RestaurantFeatureTests(unittest.TestCase):
             (variant["id"],)).fetchone()[0]
         self.assertEqual(restored, 4)
 
+    def test_catalog_max_select_and_wrong_group(self):
+        section = self.conn.execute("SELECT id FROM sections LIMIT 1").fetchone()
+        product = server.h_catalog_product_create([], {
+            "branch_id": 1,
+            "section_id": section["id"],
+            "name": "Extras Pizza",
+            "variants": [{
+                "name": "Regular", "price_cents": 1000,
+                "stock_qty": None, "is_default": 1, "active": 1,
+            }],
+        }, self.conn)
+        product_id = product["product_id"]
+        extras = server.h_catalog_group_create([], {
+            "branch_id": 1, "name": "Extras",
+            "selection_type": "multi", "min_select": 0, "max_select": 2,
+        }, self.conn)
+        extra1 = server.h_catalog_option_create([str(extras["modifier_group_id"])], {
+            "branch_id": 1, "name": "Olives", "price_delta_cents": 100,
+        }, self.conn)
+        extra2 = server.h_catalog_option_create([str(extras["modifier_group_id"])], {
+            "branch_id": 1, "name": "Cheese", "price_delta_cents": 200,
+        }, self.conn)
+        server.h_catalog_product_groups([str(product_id)], {
+            "branch_id": 1,
+            "modifier_groups": [{
+                "modifier_group_id": extras["modifier_group_id"],
+                "override_min": 0, "override_max": 2,
+            }],
+        }, self.conn)
+        other = server.h_catalog_group_create([], {
+            "branch_id": 1, "name": "Crust",
+            "selection_type": "single", "min_select": 0, "max_select": 1,
+        }, self.conn)
+        wrong = server.h_catalog_option_create([str(other["modifier_group_id"])], {
+            "branch_id": 1, "name": "Thin", "price_delta_cents": 0,
+        }, self.conn)
+        variant = self.conn.execute(
+            "SELECT id FROM product_variants WHERE product_id=?",
+            (product_id,)).fetchone()
+        with self.assertRaises(server.ApiError) as error:
+            server.h_catalog_order_create({
+                "table_no": 6,
+                "lines": [{
+                    "product_id": product_id,
+                    "variant_id": variant["id"],
+                    "modifier_option_ids": [
+                        extra1["modifier_option_id"],
+                        extra2["modifier_option_id"],
+                        wrong["modifier_option_id"],
+                    ],
+                    "qty": 1,
+                }],
+            }, self.conn, 1)
+        self.assertEqual(error.exception.code, 400)
+        successful = server.h_catalog_order_create({
+                "table_no": 6,
+                "lines": [{
+                    "product_id": product_id,
+                    "variant_id": variant["id"],
+                    "modifier_option_ids": [
+                        extra1["modifier_option_id"],
+                        extra2["modifier_option_id"],
+                    ],
+                    "qty": 1,
+                }],
+            }, self.conn, 1)
+        self.assertTrue(successful["order_id"] > 0)
+
     def test_catalog_modifier_and_variant_validation(self):
         section = self.conn.execute("SELECT id FROM sections LIMIT 1").fetchone()
         product = server.h_catalog_product_create([], {

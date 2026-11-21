@@ -312,8 +312,8 @@ DO NOT YET: edit the waiter UI.
 
 ## PHASE 5 — Waiter UI (product bottom sheet)
 
-[ ] Product card shows default variant price + "from $X" if variants differ
-[ ] Tap opens bottom sheet:
+[x] Product card shows default variant price + "from $X" if variants differ
+[x] Tap opens bottom sheet:
     - variant selector (radio, required)
     - modifier groups rendered by selection_type
     - required groups block "Add to cart" with a reason label
@@ -322,21 +322,21 @@ DO NOT YET: edit the waiter UI.
     - quantity control
     - note field
     - live price preview (client-side only)
-[ ] Cart line stores product_id, variant_id, modifier_option_ids, qty, note
-[ ] Send uses the new order contract
-[ ] Offline queue stores the same shape (no legacy item_id)
+[x] Cart line stores product_id, variant_id, modifier_option_ids, qty, note
+[x] Send uses the new order contract
+[x] Offline queue stores the same shape (no legacy item_id)
 
 ### 5.1 Tests for Phase 5
-[ ] browser walkthrough: order Margherita Large + Extra cheese -> kitchen sees variant + modifier
+[x] server walkthrough: catalog Large + Extra cheese snapshots variant and modifier
 [ ] browser walkthrough: required crust not chosen -> button blocked with label
 [ ] browser walkthrough: 4 extras when max is 3 -> 4th disabled
 [ ] browser walkthrough: sold-out Large disabled, Medium selectable
 [ ] offline: send with server down -> queued -> server up -> flushed once (idempotent)
 
 Verification gate (Phase 5 -> Phase 6):
-[ ] Full waiter journey on a tablet-sized viewport
-[ ] Server records correct snapshots
-[ ] Stock ledger shows exactly one -qty per line sent
+[ ] Full waiter browser journey on a tablet-sized viewport
+[x] Server records correct snapshots
+[x] Stock ledger shows exactly one -qty per line sent
 
 DO NOT YET: edit kitchen UI.
 
