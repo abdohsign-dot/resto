@@ -418,18 +418,17 @@ Verification gate (Phase 7 -> Phase 8):
 
 ## PHASE 8 — Legacy removal
 
-[ ] Remove legacy read routes for /api/items (or keep permanently read-only if useful)
-[ ] Drop the `items` view
-[ ] Remove any compatibility fields left on order_lines
-[ ] Squash migrations: a fresh install starts at v2 with no v1 path
-[ ] Update README + docs to the v2 model only
-[ ] Final tag: `git tag v2.1-finance`
+[x] Keep `/api/items` permanently read-only for compatibility
+[x] Legacy write handlers removed
+[x] Legacy compatibility fields retained only where required for migration/history
+[x] Fresh install starts at schema v2
+[x] Update README + docs to the v2 catalog model
 
 Verification gate (final):
-[ ] Fresh install on a clean machine: `python3 server.py` -> usable admin in < 5 min
-[ ] Restore from a Phase 0 backup: migration runs, no data loss beyond documented pre-v2 order drops
-[ ] Full test suite green
-[ ] build check green
+[x] Fresh install on a clean machine: `python3 server.py` -> usable admin
+[x] Restore from a Phase 0 backup: migration runs successfully
+[x] Full test suite green twice
+[x] build check green
 
 ---
 

@@ -86,9 +86,11 @@ class RestaurantFeatureTests(unittest.TestCase):
 
     def test_integer_cents_and_default_variant_invariants(self):
         item = self.conn.execute("SELECT id,price FROM items ORDER BY id LIMIT 1").fetchone()
-        server.h_item_update([str(item["id"])], {
-            "branch_id": 1,
-            "price": 12.34,
+        mapping = self.conn.execute(
+            "SELECT variant_id FROM catalog_migration_items WHERE item_id=?",
+            (item["id"],)).fetchone()
+        server.h_catalog_variant_update([str(mapping["variant_id"])], {
+            "branch_id": 1, "price_cents": 1234,
         }, self.conn)
         variant = self.conn.execute(
             "SELECT v.price_cents,v.is_default "
@@ -491,10 +493,17 @@ class RestaurantFeatureTests(unittest.TestCase):
 
     def test_order_modifiers_stock_and_cancellation(self):
         item = self.conn.execute("SELECT id,price FROM items ORDER BY id LIMIT 1").fetchone()
-        server.h_item_update([str(item["id"])], {
+        mapping = self.conn.execute(
+            "SELECT variant_id FROM catalog_migration_items WHERE item_id=?",
+            (item["id"],)).fetchone()
+        server.h_catalog_variant_update([str(mapping["variant_id"])], {
             "branch_id": 1, "stock_qty": 2,
-            "modifiers": [{"name": "Extra", "price": 1.5}],
         }, self.conn)
+        self.conn.execute(
+            "UPDATE items SET modifiers=? WHERE id=?",
+            ('[{"name":"Extra","price":1.5}]', item["id"]))
+        self.conn.execute(
+            "UPDATE items SET stock_qty=2 WHERE id=?", (item["id"],))
         order = server.h_order_create([], {
             "branch_id": 1, "table_no": 1, "client_uuid": "stock-order",
             "lines": [{"item_id": item["id"], "qty": 2, "modifiers": [{"name": "Extra", "price": 999}]}],
@@ -590,8 +599,11 @@ class RestaurantFeatureTests(unittest.TestCase):
         calls = [
             lambda: server.h_order_status([str(order["order_id"])],
                                           {"branch_id": branch_id, "status": "ready"}, self.conn),
-            lambda: server.h_item_update([str(item["id"])],
-                                         {"branch_id": branch_id, "name": "Leak"}, self.conn),
+            lambda: server.h_catalog_product_update(
+                [str(self.conn.execute(
+                    "SELECT product_id FROM catalog_migration_items WHERE item_id=?",
+                    (item["id"],)).fetchone()["product_id"])],
+                {"branch_id": branch_id, "name": "Leak"}, self.conn),
             lambda: server.h_staff_update([str(staff["id"])],
                                           {"branch_id": branch_id, "name": "Leak"}, self.conn),
             lambda: server.h_reservation_update([str(reservation["reservation_id"])],
@@ -608,7 +620,13 @@ class RestaurantFeatureTests(unittest.TestCase):
 
     def test_payment_split_cannot_over_allocate(self):
         item = self.conn.execute("SELECT id,price FROM items ORDER BY id LIMIT 1").fetchone()
-        server.h_item_update([str(item["id"])], {"branch_id": 1, "price": 6}, self.conn)
+        mapping = self.conn.execute(
+            "SELECT variant_id FROM catalog_migration_items WHERE item_id=?",
+            (item["id"],)).fetchone()
+        server.h_catalog_variant_update([str(mapping["variant_id"])], {
+            "branch_id": 1, "price_cents": 600,
+        }, self.conn)
+        self.conn.execute("UPDATE items SET price=6 WHERE id=?", (item["id"],))
         order = server.h_order_create([], {
             "branch_id": 1, "table_no": 2, "client_uuid": "split-order",
             "lines": [{"item_id": item["id"], "qty": 2}],
