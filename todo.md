@@ -1,0 +1,452 @@
+# TODO — Restaurant Ordering System: Catalog & Finance Foundation
+
+Legend: [ ] todo  [x] done  [~] in progress  [!] blocked
+Rule: do not start a phase until the previous phase's Verification gate passes.
+
+---
+
+## PHASE 0 — Pre-flight (before any code)
+
+[x] Back up the current repo and any local `data/restaurant.db` to a safe folder.
+[x] Initialize Git if needed, configure the remote, and create a branch:
+    `git init` (only if not already a repository),
+    `git checkout -b catalog-foundation`
+[x] Since this is currently not a Git repository, do not run Git destructive
+    commands until the repository and remote are initialized.
+[x] Confirm Python version on dev machine: `python3 --version` (must be >= 3.10)
+[x] Run the current tests once to record the baseline:
+    `python3 -m unittest -v test_server_features.py`
+[x] Record the baseline: 10 tests, 9 passing, 1 failing with
+    `FileNotFoundError` because the temporary audit-log directory is not created.
+[x] Fix the baseline audit-log test setup or make audit directory initialization
+    consistent before beginning Phase 1.
+[x] Confirm no real users / no production data (project assumption).
+[x] Freeze UI work: no changes to app1.js/app2.js/app3.js during Phases 1-3.
+[x] Confirm the existing test suite is green before the catalog work starts.
+
+Verification gate:
+[x] Baseline test suite passes: 10 of 10 tests.
+[x] Branch `catalog-foundation` exists and is ready to push.
+
+DO NOT YET: touch the admin UI, touch the waiter UI, add endpoints.
+
+---
+
+## PHASE 1 — Schema, migration, and repository hygiene (FIRST COMMIT)
+
+### 1.1 Schema version guard
+[ ] In server.py define `DB_VERSION = 2`.
+[ ] On startup, read `PRAGMA user_version`.
+[ ] If `user_version > DB_VERSION`: print a clear error and `sys.exit(1)`.
+    Message must name both versions and say "upgrade server.py or restore an older backup".
+[ ] If `user_version < DB_VERSION`: run migration inside a transaction; rollback on any failure.
+[ ] On success: `PRAGMA user_version = 2`.
+[ ] Write migration idempotency test (run twice, second run is a no-op).
+
+### 1.2 New catalog tables
+[ ] `sections` (id, branch_id, name, sort_order, active)
+      - migration from current `position` to `sort_order`
+      - preserve existing `kitchen_station`
+[ ] `products` (id, section_id, name, description, image_path, active, sort_order, deleted_at)
+      - migration from legacy `items.image_url` to `image_path`
+[ ] `product_variants` (id, product_id, name, price_cents, stock_qty NULL=untracked,
+      is_default, sort_order, active)
+      + partial unique index: exactly one `is_default=1` per product
+      + `UNIQUE(product_id, name)`
+[ ] `modifier_groups` (id, branch_id, name, selection_type, min_select, max_select)
+      + `UNIQUE(branch_id, name)`
+      + `CHECK(max_select >= min_select)`
+[ ] `modifier_options` (id, modifier_group_id, name, price_delta_cents, sort_order, active)
+      + `UNIQUE(modifier_group_id, name)`
+[ ] `product_modifier_groups` (product_id, modifier_group_id, sort_order, override_min, override_max)
+      + document NULL semantics: NULL = inherit from group
+[ ] Indexes:
+    - products(section_id) WHERE deleted_at IS NULL
+    - product_variants(product_id)
+    - modifier_options(modifier_group_id)
+    - product_modifier_groups(modifier_group_id)
+
+### 1.3 Stock ledger (replaces any boolean stock flag)
+[ ] `stock_movements` (id, variant_id, order_line_id, delta, reason, created_at, actor)
+[ ] reason values documented: order_accept, cancel, refund, manual_adjust
+[ ] Decision: keep `product_variants.stock_qty` as a cached, indexed quantity
+    and require every stock change to update the cache and append a ledger row
+    in the same transaction.
+[ ] If ledger replay is ever used, it must reconcile the cache from movements.
+[ ] `stock_qty` remains `NULL` for untracked stock and never becomes negative.
+
+### 1.4 Finance foundation (schema compatibility)
+[ ] Audit the existing `payments`, `payment_allocations`, `orders`, and
+    `order_items` tables before adding any parallel finance model.
+[ ] Inventory existing payment behavior and public API contracts in the migration
+    plan so catalog work does not replace or break it accidentally.
+[ ] If `bills` are added now, integrate them with existing orders rather than
+    creating a disconnected bill/payment system.
+[ ] `bills` (id, branch_id, table_id, status, opened_at, closed_at)
+[ ] `bill_items` (id, bill_id, order_line_id, qty, unit_price_cents) + UNIQUE(bill_id, order_line_id)
+[ ] `payments` (id, bill_id, amount_cents, method, recorded_by, recorded_at, note)
+[ ] `refunds` (id, payment_id, amount_cents, reason, recorded_at)
+[ ] State invariants in code comments:
+    - "A bill snapshots order lines; later menu price changes never alter it."
+    - "Every refund references a payment; every payment references a bill."
+    - "Every bill references order lines."
+
+### 1.5 Order-line extension
+[ ] In the existing `order_items` table, add `variant_id`
+[ ] In the existing `order_items` table, add `variant_name`
+[ ] In the existing `order_items` table, add `modifiers_json`
+[ ] Add these columns as nullable for legacy/test order rows.
+[ ] Keep existing item and order snapshots readable while adding catalog fields.
+[ ] DO NOT add a `stock_debited` boolean — the ledger replaces it.
+
+### 1.6 Legacy items compatibility
+[ ] Preserve or migrate the existing `items` table during Phase 1;
+    do not hard-drop it before all current server routes are safely migrated.
+[ ] If a read-only compatibility view is used, name it clearly as a compatibility
+    projection and do not accidentally remove the existing write API mid-phase.
+[ ] Create `items_compat` as a VIEW over products JOIN default variant, or expose
+    the existing `/api/items` route as a read-only projection.
+      Columns: id, section_id, name, description, price_cents, active, stock_qty, image_path
+[ ] Keep all existing `items` writes working for legacy UI clients until Phase 2
+    compatibility adapters are tested.
+[ ] Record legacy writes at the catalog layer, never as a separate source of truth.
+[ ] Remove legacy write routes in Phase 2 only after the new catalog API passes
+    positive and negative tests.
+
+### 1.7 Data migration (test data only — destructive is allowed)
+[ ] For each legacy item: create product + one default variant "Regular" at item price.
+[ ] If legacy modifiers exist: create one per-product modifier_group and move options into it.
+[ ] Preserve existing `order_items` rows and make catalog snapshot columns nullable.
+[ ] Map legacy order-item data to historical names/prices as snapshots even where
+    no variant ID exists.
+[ ] Record in the migration docstring: "legacy order rows retain item snapshots;
+    variant IDs are nullable until future catalog-backed lines".
+[ ] Destructive local-only cleanup is not required; in no case delete an order or
+    order item merely to simplify migration.
+
+### 1.8 Repository hygiene (same commit)
+[ ] Create `.gitignore`:
+      __pycache__/
+      *.pyc
+      data/logs/
+      data/tickets/
+      data/item_images/
+      data/restaurant.db
+      config.json
+[ ] `git rm -r --cached __pycache__ data`
+[ ] Commit `data/.gitkeep` and `config.example.json`
+[ ] Add `LICENSE` (MIT or "source-available, all rights reserved")
+[ ] Move screenshots to `docs/screenshots/`
+
+### 1.9 Tests for Phase 1
+[ ] test_migration_flat_to_variants
+[ ] test_migration_idempotent (run twice)
+[ ] test_refuse_start_when_db_newer_than_binary
+[ ] test_zero_variants_rejected
+[ ] test_duplicate_default_variant_rejected
+[ ] test_missing_default_variant_rejected
+[ ] test_integer_cents_roundtrip
+[ ] test_stock_deducted_on_accept_via_ledger
+[ ] test_stock_restored_on_cancel_via_ledger
+[ ] test_branch_isolation_products (negative case: wrong branch header -> 404)
+[ ] test_legacy_items_projection_or_adapter
+
+Verification gate (Phase 1 -> Phase 2):
+[ ] `python3 -m unittest -v test_server_features.py` — all pass
+[ ] Fresh DB: `rm data/restaurant.db && python3 server.py` starts cleanly, no errors
+[ ] Old DB copy: restore a Phase 0 backup, start server, migration runs, tests pass
+[ ] A grep audit documents every remaining legacy `items` read/write and assigns
+    it to the compatibility or migration checklist item
+[ ] `git status` shows no `data/`, no `__pycache__`, no `config.json`
+[ ] Commit message: "catalog foundation: schema v2, stock ledger, repo hygiene"
+[ ] Push the branch.
+
+DO NOT YET: add endpoints, edit UI, add drag-and-drop, add shared modifier groups.
+
+---
+
+## PHASE 2 — Server API (catalog read + write)
+
+### 2.1 Catalog endpoints
+[ ] GET    /api/sections
+[ ] POST   /api/sections                         {name, sort_order}
+[ ] PATCH  /api/sections/{id}                    {name?, sort_order?, active?}
+[ ] DELETE /api/sections/{id}                    -> 409 if non-empty
+[ ] GET    /api/products?section_id=&q=
+[ ] POST   /api/products                         atomic: product + variants + group attachments
+[ ] PATCH  /api/products/{id}
+[ ] DELETE /api/products/{id}                    soft-delete if referenced by open ticket
+[ ] GET    /api/products/{id}/variants
+[ ] POST   /api/products/{id}/variants
+[ ] PATCH  /api/variants/{id}
+[ ] DELETE /api/variants/{id}                    -> 409 if in open ticket
+[ ] PUT    /api/products/{id}/variants           bulk replace (for later "apply to section")
+[ ] GET    /api/modifier-groups
+[ ] POST   /api/modifier-groups
+[ ] PATCH  /api/modifier-groups/{id}
+[ ] DELETE /api/modifier-groups/{id}
+[ ] GET    /api/modifier-groups/{id}/options
+[ ] POST   /api/modifier-groups/{id}/options
+[ ] PATCH  /api/modifier-options/{id}
+[ ] DELETE /api/modifier-options/{id}
+[ ] PUT    /api/products/{id}/modifier-groups    attach/detach + override_min/override_max
+
+### 2.2 Validation (all server-side)
+[ ] product must have >= 1 active variant
+[ ] exactly one default variant
+[ ] variant name unique within product
+[ ] variant price_cents integer >= 0
+[ ] stock_qty NULL or integer >= 0
+[ ] name/description length bounds
+[ ] required group has min_select >= 1
+[ ] max_select >= min_select
+[ ] modifier_option_ids belong to groups attached to the product
+[ ] duplicate modifier_option_ids rejected
+[ ] unit price ALWAYS recomputed server-side (client price ignored)
+
+### 2.3 Order creation contract (replace item-only contract)
+[ ] New body:
+    { lines: [ { product_id, variant_id, modifier_option_ids, qty, note } ] }
+[ ] Verify product + variant belong to branch
+[ ] Verify variant active and stocked
+[ ] Validate modifiers against attached groups (required/min/max)
+[ ] Recompute price in cents
+[ ] Snapshot variant_name, modifiers_json (names + deltas), unit_price_cents
+[ ] Deduct stock atomically:
+      UPDATE product_variants SET stock_qty = stock_qty - :qty
+       WHERE id = :variant_id AND (stock_qty IS NULL OR stock_qty >= :qty);
+      check rowcount; if 0 -> reject
+[ ] INSERT stock_movements(delta=-qty, reason='order_accept')
+[ ] Return full ticket with names + snapshots
+
+### 2.4 Legacy /api/items remains read-only
+[ ] GET /api/items continues to work via the view
+[ ] No POST/PATCH/DELETE on /api/items (return 405 explicitly)
+
+### 2.5 Tests for Phase 2
+[ ] test_atomic_product_save_rolls_back_on_invalid_variant
+[ ] test_required_modifier_group_blocks_order
+[ ] test_max_select_enforced
+[ ] test_min_select_enforced
+[ ] test_wrong_group_modifier_rejected
+[ ] test_inactive_variant_rejected
+[ ] test_server_recomputes_price_ignores_client
+[ ] test_stock_deduction_atomic_under_concurrent_orders
+[ ] test_stock_restored_on_cancel
+[ ] test_historical_price_preserved_after_variant_price_change
+[ ] test_soft_delete_variant_in_open_ticket_returns_409
+[ ] test_items_endpoint_rejects_writes_with_405
+[ ] test_branch_isolation_on_every_catalog_route
+
+Verification gate (Phase 2 -> Phase 3):
+[ ] All tests pass
+[ ] Manual curl: create section -> product -> variants -> attach group ->
+    create order with modifiers -> verify ticket snapshot -> cancel -> verify
+    stock ledger has a - and a + movement
+[ ] `python3 server.py` starts cleanly on a fresh DB
+
+DO NOT YET: edit the admin UI. The API is the contract; the UI comes after.
+
+---
+
+## PHASE 3 — Build check and regression lock
+
+[ ] Define `build_app.py --check`:
+    regenerate into temp file, diff against committed app.html, exit non-zero on diff
+[ ] Add the check to the Phase 3 verification run
+[ ] Re-run full test suite twice to confirm no flakiness
+
+Verification gate (Phase 3 -> Phase 4):
+[ ] `python3 -m unittest -v test_server_features.py` passes
+[ ] `python3 build_app.py --check` passes
+[ ] `python3 server.py` starts cleanly
+[ ] Tag the commit: `git tag v2.0-catalog-api`
+
+DO NOT YET: start the editor.
+
+---
+
+## PHASE 4 — Admin three-pane editor (UI)
+
+Scope for this phase (do not add beyond this):
+- sections pane
+- products pane
+- product editor (variants, one modifier group attachment, overrides)
+
+Deferred to Phase 7:
+- drag-and-drop reordering
+- shared cross-product group management UI
+- bulk variant apply
+- per-variant images
+- merge/consolidation tools
+
+### 4.1 Sections pane
+[ ] list sections
+[ ] create / rename / hide / soft-delete
+[ ] reorder (buttons for now, drag-and-drop later)
+
+### 4.2 Products pane
+[ ] list products for selected section
+[ ] search (client-side filter over loaded list is fine)
+[ ] create product (opens editor with one empty variant)
+[ ] edit product
+[ ] soft-delete product
+
+### 4.3 Product editor
+[ ] name, description, image upload
+[ ] variants table: add row, edit name/price/stock, set default, delete (block last)
+[ ] attach one modifier group (checkbox list)
+[ ] per-product override_min / override_max (NULL = inherit)
+[ ] Save is atomic: one POST/PATCH with everything
+[ ] Show server validation errors inline, not as a generic toast
+
+### 4.4 Tests for Phase 4
+[ ] browser walkthrough: create section, product, 3 variants, attach group, save
+[ ] browser walkthrough: attempt save with 0 variants -> inline error
+[ ] browser walkthrough: set two defaults -> inline error
+[ ] browser walkthrough: price change on a variant -> old ticket unaffected
+
+Verification gate (Phase 4 -> Phase 5):
+[ ] Admin can build a Margherita with Small/Medium/Large in under 2 minutes
+[ ] Admin can build a Chicken with Full/Half in under 2 minutes
+[ ] API tests still pass
+[ ] build check still passes
+
+DO NOT YET: edit the waiter UI.
+
+---
+
+## PHASE 5 — Waiter UI (product bottom sheet)
+
+[ ] Product card shows default variant price + "from $X" if variants differ
+[ ] Tap opens bottom sheet:
+    - variant selector (radio, required)
+    - modifier groups rendered by selection_type
+    - required groups block "Add to cart" with a reason label
+    - max_select disables unchecked options when reached
+    - sold-out variant shown disabled with "sold out"
+    - quantity control
+    - note field
+    - live price preview (client-side only)
+[ ] Cart line stores product_id, variant_id, modifier_option_ids, qty, note
+[ ] Send uses the new order contract
+[ ] Offline queue stores the same shape (no legacy item_id)
+
+### 5.1 Tests for Phase 5
+[ ] browser walkthrough: order Margherita Large + Extra cheese -> kitchen sees variant + modifier
+[ ] browser walkthrough: required crust not chosen -> button blocked with label
+[ ] browser walkthrough: 4 extras when max is 3 -> 4th disabled
+[ ] browser walkthrough: sold-out Large disabled, Medium selectable
+[ ] offline: send with server down -> queued -> server up -> flushed once (idempotent)
+
+Verification gate (Phase 5 -> Phase 6):
+[ ] Full waiter journey on a tablet-sized viewport
+[ ] Server records correct snapshots
+[ ] Stock ledger shows exactly one -qty per line sent
+
+DO NOT YET: edit kitchen UI.
+
+---
+
+## PHASE 6 — Kitchen display and ticket printing
+
+### 6.1 Kitchen display
+[ ] Ticket line renders: "2x Margherita (Large) $28.00"
+[ ] Modifier sub-lines rendered under the product line
+[ ] Note rendered under modifiers
+[ ] Status derivation unchanged
+
+### 6.2 ESC/POS ticket
+[ ] 42-column layout includes variant name
+[ ] Modifiers as indented sub-lines, 2-space indent, wrap at 40 chars
+[ ] Note as indented sub-line
+[ ] Cancellation banner unchanged
+
+### 6.3 Browser print view
+[ ] Same content as ESC/POS ticket
+
+### 6.4 Tests for Phase 6
+[ ] archived .txt ticket contains variant name and modifier names
+[ ] long modifier name wraps at 40 chars without breaking the layout
+[ ] historical ticket reprint after a price change shows the original prices
+
+Verification gate (Phase 6 -> Phase 7):
+[ ] Physical printer (or emulator) prints a correct ticket with variant + modifiers
+[ ] Kitchen display shows variant + modifiers on a phone-sized viewport
+[ ] No regressions in the Phase 2-5 test suite
+
+---
+
+## PHASE 7 — Finance and stabilization
+
+Now, and only now, build the endpoints and UI for bills/payments/refunds
+(the tables already exist from Phase 1).
+
+### 7.1 Bills
+[ ] POST /api/bills                      {table_id} -> opens a bill, snapshots open lines
+[ ] GET  /api/bills/{id}
+[ ] POST /api/bills/{id}/items           attach order_line_ids (snapshot unit_price_cents)
+[ ] POST /api/bills/{id}/close
+
+### 7.2 Payments and refunds
+[ ] POST /api/bills/{id}/payments        {amount_cents, method}
+[ ] POST /api/payments/{id}/refunds      {amount_cents, reason}
+[ ] Validation: sum(payments) <= bill total; refund <= payment amount
+[ ] Admin UI: record payment, split by line qty, record refund
+[ ] Waiter UI: "request bill" button
+
+### 7.3 Sales summary
+[ ] GET /api/reports/sales?days=7|30|90  -> received payments, top items
+
+### 7.4 Deferred-but-now-allowed (pick what is needed)
+[ ] shared cross-product modifier groups UI
+[ ] bulk variant application to a section
+[ ] drag-to-reorder in admin
+[ ] per-waiter PIN or badge
+[ ] TLS deployment guidance (reverse proxy) in docs only
+[ ] backup command: `python3 server.py --backup /path/to/backup.zip`
+[ ] health endpoint: GET /health
+
+### 7.5 Tests for Phase 7
+[ ] test_payment_split_sums_to_bill_total
+[ ] test_overpayment_rejected
+[ ] test_refund_cannot_exceed_payment
+[ ] test_bill_snapshot_immune_to_menu_price_change
+[ ] test_cancel_unpaid_order_restores_stock_via_ledger
+[ ] test_sales_summary_windows_7_30_90
+
+Verification gate (Phase 7 -> Phase 8):
+[ ] Full finance journey in the admin UI on a real device
+[ ] Ledger + payments reconcile to the cent
+[ ] All tests pass
+
+---
+
+## PHASE 8 — Legacy removal
+
+[ ] Remove legacy read routes for /api/items (or keep permanently read-only if useful)
+[ ] Drop the `items` view
+[ ] Remove any compatibility fields left on order_lines
+[ ] Squash migrations: a fresh install starts at v2 with no v1 path
+[ ] Update README + docs to the v2 model only
+[ ] Final tag: `git tag v2.1-finance`
+
+Verification gate (final):
+[ ] Fresh install on a clean machine: `python3 server.py` -> usable admin in < 5 min
+[ ] Restore from a Phase 0 backup: migration runs, no data loss beyond documented pre-v2 order drops
+[ ] Full test suite green
+[ ] build check green
+
+---
+
+## Global guardrails (apply to every phase)
+
+[ ] Never edit app.html directly; always rebuild via build_app.py
+[ ] During Phase 1, legacy `items` compatibility writes are allowed only if they
+    route through a migration/adapter into the catalog tables
+[ ] Never expose `items` as an independent second source of truth
+[ ] Never store money as float; always integer cents
+[ ] Never trust a client-computed price; server recomputes
+[ ] Never add a new stock write without a stock_movements row in the same transaction
+[ ] Every new endpoint gets at least one positive and one negative test
+[ ] Every phase ends with a verification gate and a push

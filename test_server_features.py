@@ -19,6 +19,7 @@ class RestaurantFeatureTests(unittest.TestCase):
         server.TICKETS_DIR = os.path.join(self.temp.name, "tickets")
         server.IMAGES_DIR = os.path.join(self.temp.name, "item_images")
         server.AUDIT_DIR = os.path.join(self.temp.name, "logs")
+        os.makedirs(server.AUDIT_DIR, exist_ok=True)
         server.CONFIG = dict(server.DEFAULT_CONFIG)
         server.init_db()
         self.conn = server.db()
@@ -208,6 +209,7 @@ class RestaurantFeatureTests(unittest.TestCase):
         thread.start()
         base_url = "http://127.0.0.1:%d" % httpd.server_address[1]
         server.AUDIT_DIR = os.path.join(self.temp.name, "logs")
+        os.makedirs(server.AUDIT_DIR, exist_ok=True)
         try:
             payload = json.dumps({
                 "branch_id": 1, "guest_name": "Sensitive Audit Guest",
