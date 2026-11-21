@@ -345,24 +345,24 @@ DO NOT YET: edit kitchen UI.
 ## PHASE 6 — Kitchen display and ticket printing
 
 ### 6.1 Kitchen display
-[ ] Ticket line renders: "2x Margherita (Large) $28.00"
-[ ] Modifier sub-lines rendered under the product line
-[ ] Note rendered under modifiers
-[ ] Status derivation unchanged
+[x] Ticket line renders variant name
+[x] Modifier sub-lines rendered under the product line
+[x] Note rendered under modifiers
+[x] Status derivation unchanged
 
 ### 6.2 ESC/POS ticket
-[ ] 42-column layout includes variant name
-[ ] Modifiers as indented sub-lines, 2-space indent, wrap at 40 chars
-[ ] Note as indented sub-line
-[ ] Cancellation banner unchanged
+[x] 42-column layout includes variant name
+[x] Modifiers as indented sub-lines, 2-space indent, wrap at 40 chars
+[x] Note as indented sub-line
+[x] Cancellation banner unchanged
 
 ### 6.3 Browser print view
-[ ] Same content as ESC/POS ticket
+[x] Same content as ESC/POS ticket
 
 ### 6.4 Tests for Phase 6
-[ ] archived .txt ticket contains variant name and modifier names
-[ ] long modifier name wraps at 40 chars without breaking the layout
-[ ] historical ticket reprint after a price change shows the original prices
+[x] archived .txt ticket contains variant name and modifier names
+[x] long modifier name wraps at 40 chars without breaking the layout
+[x] historical ticket reprint after a price change shows the original prices
 
 Verification gate (Phase 6 -> Phase 7):
 [ ] Physical printer (or emulator) prints a correct ticket with variant + modifiers

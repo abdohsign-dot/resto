@@ -637,17 +637,35 @@ def ticket_text(order, lang="fr"):
     out.append(sep)
     for l in order["lines"]:
         if l["status"] == "cancelled":
-            out.append("%dx %-24s %s" % (l["qty"], l["name"][:24], labels["cancelled"]))
+            name = l["name"]
+            if l.get("variant_name"):
+                name = "%s (%s)" % (name, l["variant_name"])
+            out.append("%dx %-24s %s" % (l["qty"], name[:24], labels["cancelled"]))
             continue
         line = "%dx %s" % (l["qty"], l["name"][:TICKET_W - 12])
-        amt = "%0.2f %s" % (l["price"] * l["qty"], cfg.get("currency") or "MAD")
+        if l.get("variant_name"):
+            line = "%dx %s (%s)" % (l["qty"], l["name"][:TICKET_W - 20],
+                                     l["variant_name"][:8])
+        snapshot_cents = l.get("unit_price_cents")
+        snapshot_price = (snapshot_cents / 100.0) if snapshot_cents is not None else l["price"]
+        amt = "%0.2f %s" % (snapshot_price * l["qty"], cfg.get("currency") or "MAD")
         out.append(line.ljust(TICKET_W - len(amt)) + amt)
         try:
             modifiers = json.loads(l.get("modifiers") or "[]")
         except (TypeError, ValueError):
             modifiers = []
+        if not modifiers and l.get("modifiers_json"):
+            try:
+                modifiers = json.loads(l["modifiers_json"] or "[]")
+            except (TypeError, ValueError):
+                modifiers = []
         if modifiers:
-            out.append("   + " + ", ".join(m["name"] for m in modifiers))
+            modifier_text = ", ".join(str(m.get("name") or "") for m in modifiers)
+            prefix = "  + "
+            width = TICKET_W - len(prefix)
+            for i in range(0, len(modifier_text), width):
+                chunk = modifier_text[i:i + width]
+                out.append((prefix if i == 0 else "    ") + chunk)
         if l["note"]:
             for sub in [l["note"][i:i + TICKET_W - 4] for i in range(0, len(l["note"]), TICKET_W - 4)]:
                 out.append("   . " + sub)
@@ -768,6 +786,14 @@ def h_state(args, body, conn):
             "SELECT i.id item_id, s.kitchen_station FROM items i "
             "JOIN sections s ON s.id=i.section_id WHERE i.branch_id=?", (branch_id,)):
         station_by_item[row["item_id"]] = row["kitchen_station"] or ""
+    station_by_variant = {}
+    for row in conn.execute(
+            "SELECT v.id variant_id,s.kitchen_station "
+            "FROM product_variants v "
+            "JOIN products p ON p.id=v.product_id "
+            "JOIN sections s ON s.id=p.section_id "
+            "WHERE s.branch_id=?", (branch_id,)):
+        station_by_variant[row["variant_id"]] = row["kitchen_station"] or ""
 
     orders = [dict(r) for r in conn.execute(
         "SELECT * FROM orders WHERE branch_id=? AND "
@@ -777,7 +803,11 @@ def h_state(args, body, conn):
         o["lines"] = [dict(r) for r in conn.execute(
             "SELECT * FROM order_items WHERE order_id=? ORDER BY id", (o["id"],))]
         for line in o["lines"]:
-            line["kitchen_station"] = station_by_item.get(line.get("item_id"), "")
+            line["kitchen_station"] = (
+                station_by_variant.get(line.get("variant_id"))
+                if line.get("variant_id") is not None
+                else station_by_item.get(line.get("item_id"), "")
+            ) or ""
             line["paid_qty"] = conn.execute(
                 "SELECT COALESCE(SUM(pa.qty * (p.amount-p.refunded_amount)/p.amount),0) q "
                 "FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id "
@@ -792,8 +822,8 @@ def h_state(args, body, conn):
         # Compute kitchen_stations: distinct non-empty stations from active (non-cancelled) lines
         stations_seen = set()
         for line in o["lines"]:
-            if line["status"] != "cancelled" and line.get("item_id") is not None:
-                ks = station_by_item.get(line["item_id"], "")
+            if line["status"] != "cancelled":
+                ks = line.get("kitchen_station") or ""
                 if ks:
                     stations_seen.add(ks)
         o["kitchen_stations"] = sorted(stations_seen)

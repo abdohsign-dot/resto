@@ -1339,6 +1339,7 @@ function confirmCatalogProduct(productId) {
 function ticketCard(o, actions) {
   var lines = o.lines.map(function (l) {
     var modifiers = lineModifiers(l.modifiers);
+    if (!modifiers.length && l.modifiers_json) modifiers = lineModifiers(l.modifiers_json);
     var modifierNames = modifiers.map(function (m) { return m.name; }).join(', ');
     return '<div class="tline' + (l.status === 'cancelled' ? ' cancelled' : '') + '">' +
       '<span>' + l.qty + '× ' + esc(localizedLabel(l.name)) +
@@ -1538,10 +1539,12 @@ function leaveRole() { goHome(); }
 function kCard(o) {
   var lines = o.lines.map(function (l) {
     var modifiers = lineModifiers(l.modifiers);
+    if (!modifiers.length && l.modifiers_json) modifiers = lineModifiers(l.modifiers_json);
     var tap = l.status === 'sent' || l.status === 'preparing';
     var cls = 'kline' + (l.status === 'cancelled' ? ' cancelled' : ' l-' + l.status);
     return '<div class="' + cls + '"' + (tap ? ' onclick="lineNext(' + o.id + ',' + l.id + ')"' : '') + '>' +
-      '<span class="kq">' + l.qty + '×</span><span>' + esc(localizedLabel(l.name)) + '</span>' +
+      '<span class="kq">' + l.qty + '×</span><span>' + esc(localizedLabel(l.name)) +
+      (l.variant_name ? ' (' + esc(l.variant_name) + ')' : '') + '</span>' +
       (modifiers.length ? '<span class="lnote">+ ' + esc(modifiers.map(function (m) { return m.name; }).join(', ')) + '</span>' : '') +
       (l.note ? '<span class="lnote">· ' + esc(l.note) + '</span>' : '') +
       '<span class="chip ' + l.status + '">' + (l.status === 'cancelled' ? '86' : tStatus(l.status)) + '</span>' +

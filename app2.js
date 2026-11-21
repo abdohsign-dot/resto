@@ -281,6 +281,7 @@ function confirmCatalogProduct(productId) {
 function ticketCard(o, actions) {
   var lines = o.lines.map(function (l) {
     var modifiers = lineModifiers(l.modifiers);
+    if (!modifiers.length && l.modifiers_json) modifiers = lineModifiers(l.modifiers_json);
     var modifierNames = modifiers.map(function (m) { return m.name; }).join(', ');
     return '<div class="tline' + (l.status === 'cancelled' ? ' cancelled' : '') + '">' +
       '<span>' + l.qty + '× ' + esc(localizedLabel(l.name)) +

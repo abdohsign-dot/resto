@@ -217,6 +217,61 @@ class RestaurantFeatureTests(unittest.TestCase):
             "SELECT image_path FROM products WHERE id=?", (product_id,)).fetchone()
         self.assertEqual(saved["image_path"], uploaded["image_url"])
 
+    def test_phase6_ticket_variant_modifiers_and_historical_price(self):
+        section = self.conn.execute("SELECT id FROM sections LIMIT 1").fetchone()
+        product = server.h_catalog_product_create([], {
+            "branch_id": 1,
+            "section_id": section["id"],
+            "name": "Ticket Pizza",
+            "variants": [{
+                "name": "Large", "price_cents": 1400,
+                "stock_qty": 5, "is_default": 1, "active": 1,
+            }],
+        }, self.conn)
+        product_id = product["product_id"]
+        variant = self.conn.execute(
+            "SELECT id FROM product_variants WHERE product_id=?",
+            (product_id,)).fetchone()
+        group = server.h_catalog_group_create([], {
+            "branch_id": 1, "name": "Extras",
+            "selection_type": "multi", "min_select": 0, "max_select": 3,
+        }, self.conn)
+        option = server.h_catalog_option_create([str(group["modifier_group_id"])], {
+            "branch_id": 1,
+            "name": "Extra cheese with a deliberately long modifier label",
+            "price_delta_cents": 200,
+        }, self.conn)
+        server.h_catalog_product_groups([str(product_id)], {
+            "branch_id": 1,
+            "modifier_groups": [{
+                "modifier_group_id": group["modifier_group_id"],
+                "override_min": 0, "override_max": 3,
+            }],
+        }, self.conn)
+        order = server.h_catalog_order_create({
+            "table_no": 14,
+            "lines": [{
+                "product_id": product_id,
+                "variant_id": variant["id"],
+                "modifier_option_ids": [option["modifier_option_id"]],
+                "qty": 2,
+                "note": "No cut",
+            }],
+        }, self.conn, 1)
+        server.h_catalog_variant_update([str(variant["id"])], {
+            "branch_id": 1, "price_cents": 1900,
+        }, self.conn)
+        loaded = server.get_order(self.conn, order["order_id"])
+        text = server.ticket_text(loaded, "en")
+        self.assertIn("Ticket Pizza (Large)", text)
+        self.assertIn("Extra cheese with a deliberately", text)
+        self.assertIn("No cut", text)
+        self.assertIn("32.00 MAD", text)
+        archived = server.save_ticket(loaded, text)
+        self.assertTrue(archived and os.path.isfile(archived))
+        reprint = server.ticket_text(server.get_order(self.conn, order["order_id"]), "en")
+        self.assertIn("32.00 MAD", reprint)
+
     def test_catalog_historical_price_and_variant_cancel_stock(self):
         section = self.conn.execute("SELECT id FROM sections LIMIT 1").fetchone()
         product = server.h_catalog_product_create([], {
