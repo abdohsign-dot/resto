@@ -55,13 +55,13 @@ class RestaurantFeatureTests(unittest.TestCase):
             item = migrated.execute("SELECT name,branch_id,stock_qty,modifiers FROM items WHERE id=1").fetchone()
             self.assertEqual(tuple(item), ("Legacy dish", 1, None, "[]"))
             product = migrated.execute(
-                "SELECT p.id,p.name,p.section_id,v.name,v.price_cents,"
+                "SELECT p.id,p.name,p.section_id,p.parent_id,p.kind,v.name,v.price_cents,"
                 "v.stock_qty,v.is_default "
                 "FROM products p JOIN product_variants v ON v.product_id=p.id "
                 "JOIN catalog_migration_items m ON m.product_id=p.id "
                 "WHERE m.item_id=1").fetchone()
             self.assertEqual(tuple(product),
-                             (product["id"], "Legacy dish", 1, "Regular",
+                             (product["id"], "Legacy dish", 1, None, "item", "Regular",
                               1250, None, 1))
             server.init_db()
             migrated.close()
@@ -218,6 +218,163 @@ class RestaurantFeatureTests(unittest.TestCase):
         saved = self.conn.execute(
             "SELECT image_path FROM products WHERE id=?", (product_id,)).fetchone()
         self.assertEqual(saved["image_path"], uploaded["image_url"])
+
+    def test_catalog_product_tree_crud_and_guards(self):
+        section_id = self.conn.execute(
+            "SELECT id FROM sections WHERE branch_id=1 LIMIT 1").fetchone()["id"]
+        root_group = server.h_catalog_product_create([], {
+            "branch_id": 1, "section_id": section_id, "kind": "group",
+            "name": "Pizza",
+        }, self.conn)
+        root_id = root_group["product_id"]
+        sub_group = server.h_catalog_product_create([], {
+            "branch_id": 1, "parent_id": root_id, "kind": "group",
+            "name": "Classic",
+        }, self.conn)
+        sub_id = sub_group["product_id"]
+        dish = server.h_catalog_product_create([], {
+            "branch_id": 1, "parent_id": sub_id, "kind": "item",
+            "name": "Margherita", "variants": [{
+                "name": "Small", "price_cents": 900, "is_default": 1,
+            }, {
+                "name": "Large", "price_cents": 1400,
+            }],
+        }, self.conn)
+        self.assertEqual(len(dish["variants"]), 2)
+        self.assertTrue(all({"id", "name"} <= set(row) for row in dish["variants"]))
+        product = self.conn.execute(
+            "SELECT parent_id,kind,section_id FROM products WHERE id=?",
+            (dish["product_id"],)).fetchone()
+        self.assertEqual(tuple(product), (sub_id, "item", section_id))
+
+        small = next(v for v in dish["variants"] if v["name"] == "Small")
+        order = server.h_catalog_order_create({
+            "table_no": 18,
+            "lines": [{
+                "product_id": dish["product_id"], "variant_id": small["id"],
+                "modifier_option_ids": [], "qty": 1,
+            }],
+        }, self.conn, 1)
+        self.assertGreater(order["order_id"], 0)
+
+        with self.assertRaises(server.ApiError) as error:
+            server.h_catalog_product_create([], {
+                "branch_id": 1, "parent_id": dish["product_id"], "kind": "group",
+                "name": "Invalid child",
+            }, self.conn)
+        self.assertEqual(error.exception.code, 400)
+        with self.assertRaises(server.ApiError) as error:
+            server.h_catalog_product_create([], {
+                "branch_id": 1, "section_id": section_id, "kind": "group",
+                "name": "Invalid group", "variants": [{
+                    "name": "Regular", "price_cents": 100, "is_default": 1,
+                }],
+            }, self.conn)
+        self.assertEqual(error.exception.code, 400)
+        with self.assertRaises(server.ApiError) as error:
+            server.h_catalog_product_delete([str(root_id)], {"branch_id": 1}, self.conn)
+        self.assertEqual(error.exception.code, 409)
+        with self.assertRaises(server.ApiError) as error:
+            server.h_catalog_product_update([str(root_id)], {
+                "branch_id": 1, "parent_id": sub_id,
+            }, self.conn)
+        self.assertEqual(error.exception.code, 400)
+        with self.assertRaises(server.ApiError) as error:
+            server.h_catalog_product_update([str(sub_id)], {
+                "branch_id": 1, "kind": "item", "variants": [{
+                    "name": "Regular", "price_cents": 100, "is_default": 1,
+                }],
+            }, self.conn)
+        self.assertEqual(error.exception.code, 409)
+
+        other_branch = server.h_branch_create([], {
+            "branch_id": 1, "name": "Tree isolation",
+        }, self.conn)["branch_id"]
+        with self.assertRaises(server.ApiError) as error:
+            server.h_catalog_product_update([str(dish["product_id"])], {
+                "branch_id": other_branch, "parent_id": root_id,
+            }, self.conn)
+        self.assertEqual(error.exception.code, 404)
+
+    def test_catalog_section_and_variant_image_uploads(self):
+        section_id = self.conn.execute(
+            "SELECT id FROM sections WHERE branch_id=1 LIMIT 1").fetchone()["id"]
+        product = server.h_catalog_product_create([], {
+            "branch_id": 1, "section_id": section_id, "name": "Image dish",
+            "variants": [{
+                "name": "Regular", "price_cents": 100, "is_default": 1,
+            }],
+        }, self.conn)
+        variant_id = product["variants"][0]["id"]
+        image = base64.b64encode(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+        ).decode("ascii")
+        section_upload = server.h_section_image([str(section_id)], {
+            "branch_id": 1, "mime": "image/png", "data": image,
+        }, self.conn)
+        variant_upload = server.h_variant_image([str(variant_id)], {
+            "branch_id": 1, "mime": "image/png", "data": image,
+        }, self.conn)
+        self.assertEqual(
+            self.conn.execute("SELECT image_path FROM sections WHERE id=?",
+                              (section_id,)).fetchone()["image_path"],
+            section_upload["image_url"])
+        self.assertEqual(
+            self.conn.execute("SELECT image_path FROM product_variants WHERE id=?",
+                              (variant_id,)).fetchone()["image_path"],
+            variant_upload["image_url"])
+        with self.assertRaises(server.ApiError) as error:
+            server.h_variant_image([str(variant_id)], {
+                "branch_id": 999, "mime": "image/png", "data": image,
+            }, self.conn)
+        self.assertEqual(error.exception.code, 404)
+
+    def test_branch_copy_preserves_catalog_tree_and_choices(self):
+        section_id = self.conn.execute(
+            "SELECT id FROM sections WHERE branch_id=1 LIMIT 1").fetchone()["id"]
+        group = server.h_catalog_product_create([], {
+            "branch_id": 1, "section_id": section_id, "kind": "group",
+            "name": "Copy root",
+        }, self.conn)
+        dish = server.h_catalog_product_create([], {
+            "branch_id": 1, "parent_id": group["product_id"], "name": "Copy dish",
+            "variants": [{
+                "name": "Large", "price_cents": 1200, "is_default": 1,
+            }],
+        }, self.conn)
+        modifier = server.h_catalog_group_create([], {
+            "branch_id": 1, "name": "Copy extras", "selection_type": "multi",
+            "min_select": 0, "max_select": 2,
+        }, self.conn)
+        option = server.h_catalog_option_create(
+            [str(modifier["modifier_group_id"])], {
+                "branch_id": 1, "name": "Olives", "price_delta_cents": 125,
+            }, self.conn)
+        server.h_catalog_product_groups([str(dish["product_id"])], {
+            "branch_id": 1, "modifier_groups": [{
+                "modifier_group_id": modifier["modifier_group_id"],
+                "override_min": 0, "override_max": 1,
+            }],
+        }, self.conn)
+
+        copied = server.h_branch_create([], {
+            "branch_id": 1, "name": "Tree copy", "copy_menu": True,
+        }, self.conn)
+        branch_id = copied["branch_id"]
+        products = server.h_catalog_products_list([], {"branch_id": branch_id}, self.conn)["products"]
+        copied_group = next(p for p in products if p["name"] == "Copy root")
+        copied_dish = next(p for p in products if p["name"] == "Copy dish")
+        self.assertEqual(copied_dish["parent_id"], copied_group["id"])
+        self.assertEqual(copied_dish["section_id"], copied_group["section_id"])
+        self.assertNotEqual(copied_dish["id"], dish["product_id"])
+        self.assertEqual(copied_dish["variants"][0]["name"], "Large")
+        self.assertEqual(copied_dish["variants"][0]["price_cents"], 1200)
+        self.assertEqual(len(copied_dish["modifier_groups"]), 1)
+        copied_group_id = copied_dish["modifier_groups"][0]["modifier_group_id"]
+        copied_options = server.h_catalog_options_list(
+            [str(copied_group_id)], {"branch_id": branch_id}, self.conn)["options"]
+        self.assertEqual(copied_options[0]["name"], "Olives")
+        self.assertNotEqual(copied_options[0]["id"], option["modifier_option_id"])
 
     def test_phase7_bill_payment_refund_snapshot_and_sales(self):
         section = self.conn.execute("SELECT id FROM sections LIMIT 1").fetchone()
@@ -711,6 +868,51 @@ class RestaurantFeatureTests(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
             thread.join()
+
+    def test_kitchen_config_staff_and_station_routing(self):
+        # 1. Add new kitchen staff with a station and PIN
+        created = server.h_staff_create([], {
+            "branch_id": 1,
+            "name": "Chef Mario",
+            "role": "kitchen",
+            "kitchen_station": "Pizza",
+            "pin": "2468",
+            "active": 1,
+        }, self.conn)
+        staff_id = created["staff_id"]
+
+        # 2. Verify auth works for station login
+        auth = server.h_staff_auth([], {"staff_id": staff_id, "pin": "2468"}, self.conn)
+        self.assertEqual(auth["kitchen_station"], "Pizza")
+        self.assertEqual(auth["role"], "kitchen")
+
+        # 3. Assign / reassign station
+        server.h_staff_update([str(staff_id)], {
+            "branch_id": 1,
+            "kitchen_station": "Grill",
+        }, self.conn)
+
+        # 4. Update section station routing
+        section = self.conn.execute("SELECT id FROM sections WHERE branch_id=1 LIMIT 1").fetchone()
+        server.h_section_update([str(section["id"])], {
+            "branch_id": 1,
+            "kitchen_station": "Grill",
+        }, self.conn)
+
+        # 5. Check state reflection
+        state = server.h_state([], {"branch_id": 1}, self.conn)
+        staff_member = [s for s in state["staff"] if s["id"] == staff_id][0]
+        self.assertEqual(staff_member["kitchen_station"], "Grill")
+        self.assertEqual(staff_member["role"], "kitchen")
+        self.assertTrue(staff_member["has_pin"])
+
+        sec = [s for s in state["sections"] if s["id"] == section["id"]][0]
+        self.assertEqual(sec["kitchen_station"], "Grill")
+
+        # 6. Delete kitchen staff
+        server.h_staff_delete([str(staff_id)], {"branch_id": 1}, self.conn)
+        state_after = server.h_state([], {"branch_id": 1}, self.conn)
+        self.assertEqual([s for s in state_after["staff"] if s["id"] == staff_id], [])
 
 
 if __name__ == "__main__":

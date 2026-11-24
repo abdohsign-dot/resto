@@ -73,39 +73,104 @@ function renderTableScreen(app, me) {
     '<div class="empty">' + tr('noOpen') + '</div>';
   var history = recent.map(function (o) { return ticketCard(o, false); }).join('');
 
-  var sections = (S.data.sections || []).filter(function (s) { return s.active; });
-  var chipAll = '<button class="btn small ' + (S.sectionFilter === 0 ? 'on' : '') +
-    '" onclick="setSectionFilter(0)">' + tr('all') + '</button>';
-  var chips = chipAll + sections.map(function (s) {
-    return '<button class="btn small ' + (S.sectionFilter === s.id ? 'on' : '') +
-      '" onclick="setSectionFilter(' + s.id + ')">' + esc(localizedLabel(s.name)) + '</button>';
-  }).join('');
-
   var q = S.search.trim().toLowerCase();
-  var items = (S.waiterProducts || []).filter(function (p) {
-    if (!p.active || p.deleted_at) return false;
-    if (S.sectionFilter && p.section_id !== S.sectionFilter) return false;
-    if (q && (localizedLabel(p.name) + ' ' + p.name + ' ' + (p.description || '')).toLowerCase().indexOf(q) < 0) return false;
-    return true;
-  });
+  var sections = (S.data.sections || []).filter(function (s) { return s.active; });
+  var selectedSection = sections.filter(function (s) { return s.id === S.sectionFilter; })[0] || null;
+  var path = (S.menuPath || []).map(findCatalogProduct).filter(Boolean);
+  if (!selectedSection) { S.sectionFilter = 0; S.menuPath = []; path = []; }
   var cart = cartFor(tableNo);
   var qtyOf = {}; cart.forEach(function (l) { qtyOf[l.product_id] = (qtyOf[l.product_id] || 0) + l.qty; });
-  var grid = items.map(function (p) {
+  function isAvailable(product) {
+    if (!product || !product.active || product.deleted_at) return false;
+    var parent = product.parent_id == null ? null : findCatalogProduct(product.parent_id);
+    return !parent || (parent.kind === 'group' && isAvailable(parent));
+  }
+  function productPath(product) {
+    var section = (S.data.sections || []).filter(function (s) {
+      return s.id === product.section_id;
+    })[0];
+    var labels = [section ? localizedLabel(section.name) : ''];
+    var chain = [], current = product, guard = 0;
+    while (current && guard++ < 100) {
+      chain.unshift(localizedLabel(current.name));
+      current = current.parent_id == null ? null : findCatalogProduct(current.parent_id);
+    }
+    return labels.concat(chain).filter(Boolean).join(' › ');
+  }
+  var grid;
+  if (q) {
+    var matches = (S.waiterProducts || []).filter(function (p) {
+      return p.kind === 'item' && isAvailable(p) &&
+        (localizedLabel(p.name) + ' ' + p.name + ' ' + (p.description || '') + ' ' +
+          productPath(p)).toLowerCase().indexOf(q) >= 0;
+    });
+    grid = matches.map(function (p) {
+      var variants = (p.variants || []).filter(function (v) { return v.active; });
+      var prices = variants.map(function (v) { return v.price_cents || 0; });
+      var minPrice = prices.length ? Math.min.apply(Math, prices) : 0;
+      return '<button class="menu-tile" onclick="chooseCatalogProduct(' + p.id + ')">' +
+        (p.image_path ? '<img class="menu-tile-image" src="' + esc(p.image_path) + '" alt="">' :
+          '<span class="menu-tile-placeholder" aria-hidden="true">🍽️</span>') +
+        '<span class="menu-tile-copy"><span class="mname">' + esc(localizedLabel(p.name)) + '</span>' +
+        '<span class="menu-tile-path">' + esc(productPath(p)) + '</span>' +
+        '<span class="mprice">' + (prices.length ? (I18N[S.lang].from || tr('price')) + ' ' + money(minPrice / 100) : '') +
+        '</span></span></button>';
+    }).join('');
+  } else if (!selectedSection) {
+    grid = sections.map(function (section) {
+      var count = (S.waiterProducts || []).filter(function (p) {
+        return p.section_id === section.id && p.parent_id == null && isAvailable(p);
+      }).length;
+      return '<button class="menu-tile" onclick="setSectionFilter(' + section.id + ')">' +
+        (section.image_path ? '<img class="menu-tile-image" src="' + esc(section.image_path) + '" alt="">' :
+          '<span class="menu-tile-placeholder" aria-hidden="true">🗂️</span>') +
+        '<span class="menu-tile-copy"><span class="mname">' + esc(localizedLabel(section.name)) + '</span>' +
+        '<span class="tag">' + count + ' ' + tr('itemsPlural') + '</span></span></button>';
+    }).join('');
+  } else {
+    var currentParent = path.length ? path[path.length - 1] : null;
+    var nodes = (S.waiterProducts || []).filter(function (p) {
+      return p.section_id === selectedSection.id && p.parent_id === (currentParent ? currentParent.id : null) &&
+        isAvailable(p);
+    });
+    grid = nodes.map(function (p) {
+      if (p.kind === 'group') {
+        var count = (S.waiterProducts || []).filter(function (child) {
+          return child.parent_id === p.id && isAvailable(child);
+        }).length;
+        return '<button class="menu-tile" onclick="openMenuGroup(' + p.id + ')">' +
+          (p.image_path ? '<img class="menu-tile-image" src="' + esc(p.image_path) + '" alt="">' :
+            '<span class="menu-tile-placeholder" aria-hidden="true">📁</span>') +
+          '<span class="menu-tile-copy"><span class="mname">' + esc(localizedLabel(p.name)) + '</span>' +
+          '<span class="tag">' + count + ' ' + tr('childCount') + '</span></span></button>';
+      }
     var variants = (p.variants || []).filter(function (v) { return v.active; });
-    var allSoldOut = variants.length > 0 && variants.every(function (v) { return v.stock_qty === 0; });
+      var allSoldOut = variants.length === 0 || variants.every(function (v) { return v.stock_qty === 0; });
     var prices = variants.map(function (v) { return v.price_cents || 0; });
     var minPrice = prices.length ? Math.min.apply(Math, prices) : 0;
     var maxPrice = prices.length ? Math.max.apply(Math, prices) : 0;
     var priceLabel = minPrice === maxPrice ? money(minPrice / 100) :
-      (I18N[S.lang].from || 'From') + ' ' + money(minPrice / 100);
-    return '<button class="mitem"' + (allSoldOut ? ' disabled' : '') + ' onclick="chooseCatalogProduct(' + p.id + ')">' +
-      (qtyOf[p.id] ? '<span class="mqty">' + qtyOf[p.id] + '</span>' : '') +
-      (p.image_path ? '<img class="mimage" src="' + esc(p.image_path) + '" alt="">' : '') +
-      '<span class="mname">' + esc(localizedLabel(p.name)) + '</span>' +
-      (p.description ? '<span class="mdesc">' + esc(p.description) + '</span>' : '') +
-      (allSoldOut ? '<span class="tag off">' + tr('outOfStock') + '</span>' : '') +
-      '<span class="mprice">' + priceLabel + '</span></button>';
-  }).join('');
+        (I18N[S.lang].from || 'From') + ' ' + money(minPrice / 100);
+      return '<button class="menu-tile" ' + (allSoldOut ? 'disabled' : '') +
+        ' onclick="chooseCatalogProduct(' + p.id + ')">' +
+        (qtyOf[p.id] ? '<span class="mqty">' + qtyOf[p.id] + '</span>' : '') +
+        (p.image_path ? '<img class="menu-tile-image" src="' + esc(p.image_path) + '" alt="">' :
+          '<span class="menu-tile-placeholder" aria-hidden="true">🍽️</span>') +
+        '<span class="menu-tile-copy"><span class="mname">' + esc(localizedLabel(p.name)) + '</span>' +
+        (p.description ? '<span class="mdesc">' + esc(p.description) + '</span>' : '') +
+        (allSoldOut ? '<span class="tag off">' + tr('outOfStock') + '</span>' :
+          '<span class="mprice">' + priceLabel + '</span>') + '</span></button>';
+    }).join('');
+  }
+  var crumbs = '<button class="btn small" onclick="menuHome()">' + tr('menuHome') + '</button>';
+  if (selectedSection) {
+    crumbs += '<span class="crumb-sep">›</span><button class="btn small" onclick="menuRoot()">' +
+      esc(localizedLabel(selectedSection.name)) + '</button>';
+    path.forEach(function (node, index) {
+      crumbs += '<span class="crumb-sep">›</span><button class="btn small" onclick="menuDepth(' +
+        (index + 1) + ')">' + esc(localizedLabel(node.name)) + '</button>';
+    });
+  }
 
   var cnt = cartCount(tableNo), tot = cartTotal(tableNo);
   var cartbar = cnt
@@ -120,17 +185,21 @@ function renderTableScreen(app, me) {
         '<h3>' + tr('menu') + '</h3>' +
         '<div class="searchrow"><input id="f-wsearch" class="in" placeholder="' + tr('searchMenu') + '" ' +
           'value="' + esc(S.search) + '" oninput="setSearch(this.value)"></div>' +
-        '<div class="chips">' + chips + '</div>' +
+        '<div class="menu-breadcrumb">' + crumbs + '</div>' +
         '<div class="menu-grid">' + (grid || '<div class="empty">' + tr('noDishes') + '</div>') + '</div>' +
       '</div></div>' +
     '</div>' + cartbar;
 }
 function setSearch(v) { S.search = v; render(); }
-function setSectionFilter(id) { S.sectionFilter = id; render(); }
+function setSectionFilter(id) { S.sectionFilter = id; S.menuPath = []; render(); }
+function menuHome() { S.sectionFilter = 0; S.menuPath = []; S.search = ''; render(); }
+function menuRoot() { S.menuPath = []; S.search = ''; render(); }
+function menuDepth(depth) { S.menuPath = S.menuPath.slice(0, depth); S.search = ''; render(); }
+function openMenuGroup(id) { S.menuPath.push(parseInt(id, 10)); S.search = ''; render(); }
 
 function chooseCatalogProduct(productId) {
   var product = findCatalogProduct(productId);
-  if (!product) return;
+  if (!product || product.kind === 'group') return;
   var variants = (product.variants || []).filter(function (v) { return v.active; });
   var defaultVariant = variants.filter(function (v) { return v.is_default; })[0] || variants[0];
   if (!variants.length) return;
@@ -140,11 +209,14 @@ function chooseCatalogProduct(productId) {
   html += '<h3>Size / variant</h3><div class="catalog-variant-picker">';
   html += variants.map(function (v) {
     var soldOut = v.stock_qty === 0;
-    return '<label class="catalog-choice' + (soldOut ? ' disabled' : '') + '">' +
+    return '<label class="catalog-choice catalog-variant-tile' + (soldOut ? ' disabled' : '') + '">' +
       '<input type="radio" name="catalog-variant" value="' + v.id + '"' +
       (soldOut ? ' disabled' : '') + (v.id === defaultVariant.id ? ' checked' : '') + '>' +
-      '<span class="grow">' + esc(v.name) + (soldOut ? ' — sold out' : '') + '</span>' +
-      '<b>' + money(v.price_cents / 100) + '</b></label>';
+      (v.image_path || product.image_path ? '<img src="' + esc(v.image_path || product.image_path) + '" alt="">' :
+        '<span class="variant-placeholder" aria-hidden="true">🍽️</span>') +
+      '<span class="catalog-choice-copy"><b>' + esc(v.name) + '</b>' +
+      (soldOut ? '<span class="tag off">' + tr('soldOutShort') + '</span>' : '') +
+      '<span class="catalog-price-badge">' + money(v.price_cents / 100) + '</span></span></label>';
   }).join('');
   html += '</div>';
   attachments.forEach(function (attachment) {
@@ -152,16 +224,19 @@ function chooseCatalogProduct(productId) {
     if (!group) return;
     var minimum = attachment.override_min != null ? attachment.override_min : group.min_select;
     var maximum = attachment.override_max != null ? attachment.override_max : group.max_select;
-    html += '<h3>' + esc(group.name) +
+    var groupLabel = group.product_id ? tr('choices') : group.name;
+    html += '<h3>' + esc(groupLabel) +
       (minimum > 0 ? ' * (choose ' + minimum + ')' : '') + '</h3><div class="catalog-option-picker">';
     (group.options || []).filter(function (o) { return o.active; }).forEach(function (o) {
-      html += '<label class="catalog-choice"><input type="' +
+      html += '<label class="catalog-choice catalog-option-tile"><input type="' +
         (group.selection_type === 'single' ? 'radio' : 'checkbox') +
         '" name="catalog-group-' + group.id + '" value="' + o.id +
         '" data-group="' + group.id + '" data-max="' + maximum +
-        '" onchange="catalogSheetChanged(' + productId + ')"><span class="grow">' +
-        esc(o.name) + '</span><b>' + ((o.price_delta_cents || 0) >= 0 ? '+' : '') +
-        money((o.price_delta_cents || 0) / 100) + '</b></label>';
+        '" onchange="catalogSheetChanged(' + productId + ')"><span class="catalog-option-name">' +
+        esc(o.name) + '</span>' +
+        ((o.price_delta_cents || 0) !== 0 ? '<b class="catalog-price-badge">' +
+        ((o.price_delta_cents || 0) > 0 ? '+' : '') +
+        money((o.price_delta_cents || 0) / 100) + '</b>' : '') + '</label>';
     });
     html += '</div>';
   });
@@ -232,7 +307,7 @@ function catalogSheetChanged(productId) {
     var minimum = attachment.override_min != null ? attachment.override_min : group.min_select;
     var selectedCount = document.querySelectorAll('.catalog-option-picker input[data-group="' +
       group.id + '"]:checked').length;
-    if (minimum > 0 && selectedCount < minimum) error = 'Choose ' + minimum + ' option(s) from ' + group.name;
+    if (minimum > 0 && selectedCount < minimum) error = 'Choose ' + minimum + ' option(s) from ' + (group.product_id ? tr('choices') : group.name);
   });
   var errorEl = document.getElementById('catalog-sheet-error');
   if (errorEl) errorEl.textContent = error;
@@ -335,7 +410,7 @@ function openReview() {
       (variant ? ' (' + esc(variant.name) + ')' : '') + '</span>' +
       '<span class="rsub">' + money(catalogLinePrice(l)) +
       (modifierNames.length ? ' · ' + esc(modifierNames.join(', ')) : '') +
-      (l.note ? ' · <b style="color:#fca5a5">' + esc(l.note) + '</b>' : '') + '</span></span>' +
+      (l.note ? ' · <b style="color:#dc2626">' + esc(l.note) + '</b>' : '') + '</span></span>' +
       '<button class="btn small" onclick="cartQty(' + idx + ',-1)">−</button>' +
       '<b>' + l.qty + '</b>' +
       '<button class="btn small" onclick="cartQty(' + idx + ',1)">＋</button>' +

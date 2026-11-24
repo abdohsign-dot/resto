@@ -99,7 +99,9 @@ CREATE TABLE IF NOT EXISTS sections (
     name TEXT NOT NULL,
     position INTEGER DEFAULT 0,
     active INTEGER DEFAULT 1,
-    branch_id INTEGER NOT NULL DEFAULT 1
+    branch_id INTEGER NOT NULL DEFAULT 1,
+    kitchen_station TEXT DEFAULT '',
+    image_path TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,6 +159,8 @@ CREATE TABLE IF NOT EXISTS branches (
 CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     section_id INTEGER NOT NULL,
+    parent_id INTEGER,
+    kind TEXT NOT NULL DEFAULT 'item',
     name TEXT NOT NULL,
     description TEXT DEFAULT '',
     image_path TEXT DEFAULT '',
@@ -173,6 +177,7 @@ CREATE TABLE IF NOT EXISTS product_variants (
     is_default INTEGER NOT NULL DEFAULT 0,
     sort_order INTEGER NOT NULL DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
+    image_path TEXT DEFAULT '',
     UNIQUE(product_id, name),
     FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
 );
@@ -190,6 +195,7 @@ CREATE TABLE IF NOT EXISTS modifier_groups (
     selection_type TEXT NOT NULL CHECK (selection_type IN ('single','multi')),
     min_select INTEGER NOT NULL DEFAULT 0,
     max_select INTEGER NOT NULL DEFAULT 1,
+    product_id INTEGER,
     CHECK (max_select >= min_select),
     UNIQUE(branch_id, name)
 );
@@ -314,6 +320,7 @@ def init_db():
         "sections": {
             "branch_id": "INTEGER NOT NULL DEFAULT 1",
             "kitchen_station": "TEXT DEFAULT ''",
+            "image_path": "TEXT DEFAULT ''",
         },
         "items": {"branch_id": "INTEGER NOT NULL DEFAULT 1", "stock_qty": "INTEGER",
                   "image_url": "TEXT DEFAULT ''", "modifiers": "TEXT NOT NULL DEFAULT '[]'"},
@@ -333,6 +340,9 @@ def init_db():
                         "modifiers_json": "TEXT",
                         "unit_price_cents": "INTEGER"},
         "payments": {"refunded_amount": "REAL NOT NULL DEFAULT 0"},
+        "products": {"parent_id": "INTEGER", "kind": "TEXT NOT NULL DEFAULT 'item'"},
+        "product_variants": {"image_path": "TEXT DEFAULT ''"},
+        "modifier_groups": {"product_id": "INTEGER"},
     }
     for table, columns in migrations.items():
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(%s)" % table)}
@@ -341,10 +351,13 @@ def init_db():
                 conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, definition))
     conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_branch_created ON orders(branch_id, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reservations_branch_time ON reservations(branch_id, starts_at)")
+    conn.execute("UPDATE sections SET kitchen_station=name WHERE kitchen_station IS NULL OR kitchen_station=''")
     row = conn.execute("SELECT value FROM meta WHERE key='rev'").fetchone()
     if row is None:
         conn.execute("INSERT INTO meta(key, value) VALUES('rev','1')")
         seed(conn)
+    if conn.execute("SELECT 1 FROM meta WHERE key='catalog_rev'").fetchone() is None:
+        conn.execute("INSERT INTO meta(key, value) VALUES('catalog_rev','1')")
     if db_version < SCHEMA_VERSION:
         try:
             conn.commit()
@@ -514,6 +527,15 @@ def bump_rev(conn):
 
 def get_rev(conn):
     return int(conn.execute("SELECT value FROM meta WHERE key='rev'").fetchone()["value"])
+
+def bump_catalog_rev(conn):
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('catalog_rev','1') "
+        "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1")
+
+def get_catalog_rev(conn):
+    row = conn.execute("SELECT value FROM meta WHERE key='catalog_rev'").fetchone()
+    return int(row["value"]) if row else 0
 
 # ---------------------------------------------------------------- helpers
 
@@ -818,17 +840,17 @@ def h_state(args, body, conn):
     # Build a quick lookup: item_id -> kitchen_station (via sections join)
     station_by_item = {}
     for row in conn.execute(
-            "SELECT i.id item_id, s.kitchen_station FROM items i "
+            "SELECT i.id item_id, s.kitchen_station, s.name section_name FROM items i "
             "JOIN sections s ON s.id=i.section_id WHERE i.branch_id=?", (branch_id,)):
-        station_by_item[row["item_id"]] = row["kitchen_station"] or ""
+        station_by_item[row["item_id"]] = (row["kitchen_station"] or row["section_name"] or "").strip()
     station_by_variant = {}
     for row in conn.execute(
-            "SELECT v.id variant_id,s.kitchen_station "
+            "SELECT v.id variant_id, s.kitchen_station, s.name section_name "
             "FROM product_variants v "
             "JOIN products p ON p.id=v.product_id "
             "JOIN sections s ON s.id=p.section_id "
             "WHERE s.branch_id=?", (branch_id,)):
-        station_by_variant[row["variant_id"]] = row["kitchen_station"] or ""
+        station_by_variant[row["variant_id"]] = (row["kitchen_station"] or row["section_name"] or "").strip()
 
     orders = [dict(r) for r in conn.execute(
         "SELECT * FROM orders WHERE branch_id=? AND "
@@ -877,6 +899,7 @@ def h_state(args, body, conn):
     return {
         "branch_id": branch_id,
         "rev": get_rev(conn),
+        "catalog_rev": get_catalog_rev(conn),
         "now": time.time(),
         "restaurant": CONFIG["restaurant_name"],
         "currency": CONFIG["currency"],
@@ -1252,13 +1275,14 @@ def h_section_create(args, body, conn):
     name = str(body.get("name") or "").strip()
     if not name:
         raise ApiError(400, "Name required")
-    kitchen_station = str(body.get("kitchen_station") or "").strip()[:100]
+    kitchen_station = str(body.get("kitchen_station") or name).strip()[:100]
     pos = conn.execute("SELECT COALESCE(MAX(position),0)+1 p FROM sections WHERE branch_id=?",
                        (branch_id,)).fetchone()["p"]
-    conn.execute("INSERT INTO sections(name, position, active, branch_id, kitchen_station) VALUES(?,?,1,?,?)",
-                 (name, pos, branch_id, kitchen_station))
+    cur = conn.execute(
+        "INSERT INTO sections(name, position, active, branch_id, kitchen_station,image_path) "
+        "VALUES(?,?,1,?,?,?)", (name, pos, branch_id, kitchen_station, ""))
     bump_rev(conn); conn.commit()
-    return {"ok": True}
+    return {"ok": True, "section_id": cur.lastrowid}
 
 def h_section_update(args, body, conn):
     branch_id = get_branch_id(body)
@@ -1275,6 +1299,9 @@ def h_section_update(args, body, conn):
     if "kitchen_station" in body:
         conn.execute("UPDATE sections SET kitchen_station=? WHERE id=? AND branch_id=?",
                      (str(body["kitchen_station"] or "").strip()[:100], sid, branch_id))
+    if "image_path" in body:
+        conn.execute("UPDATE sections SET image_path=? WHERE id=? AND branch_id=?",
+                     (str(body["image_path"] or "")[:500], sid, branch_id))
     if "sort_order" in body:
         conn.execute("UPDATE sections SET position=? WHERE id=? AND branch_id=?",
                      (int(body["sort_order"]), sid, branch_id))
@@ -1389,6 +1416,31 @@ def require_variant(conn, variant_id, product_id, branch_id):
         raise ApiError(404, "Variant not found")
     return row
 
+def require_group_parent(conn, parent_id, branch_id):
+    """A node can only be nested inside a sub-section (kind='group')."""
+    parent = require_product(conn, parent_id, branch_id)
+    if parent["kind"] != "group":
+        raise ApiError(400, "Menu sub-items can only be placed inside a sub-section")
+    return parent
+
+def product_descendant_ids(conn, product_id):
+    """The node itself plus every product below it in the menu tree."""
+    rows = conn.execute(
+        "WITH RECURSIVE sub(id) AS ( "
+        "  SELECT ? UNION ALL "
+        "  SELECT p.id FROM products p JOIN sub ON p.parent_id=sub.id) "
+        "SELECT id FROM sub", (product_id,)).fetchall()
+    return [r["id"] for r in rows]
+
+def count_product_children(conn, product_id):
+    return conn.execute(
+        "WITH RECURSIVE descendants(id) AS ("
+        " SELECT id FROM products WHERE parent_id=?"
+        " UNION ALL SELECT p.id FROM products p JOIN descendants d ON p.parent_id=d.id)"
+        " SELECT COUNT(*) c FROM products p JOIN descendants d ON d.id=p.id "
+        " WHERE p.deleted_at IS NULL",
+        (product_id,)).fetchone()["c"]
+
 def validate_variants(conn, product_id, variants):
     if not isinstance(variants, list) or not variants:
         raise ApiError(400, "Product requires at least one variant")
@@ -1419,6 +1471,78 @@ def validate_variants(conn, product_id, variants):
             "active": int(bool(variant.get("active", 1))),
         })
     return normalized
+
+def sync_product_choices(conn, product_id, branch_id, choices):
+    """Replace a dish's simple 'choices' list.
+
+    Each dish owns at most one hidden modifier group (product_id set) whose
+    options are the choices shown to waiters. Options are upserted by position
+    so existing option ids (referenced by past orders) survive edits; removed
+    choices are soft-deleted.
+    """
+    group = conn.execute(
+        "SELECT * FROM modifier_groups WHERE product_id=? AND branch_id=?",
+        (product_id, branch_id)).fetchone()
+    clean = []
+    for choice in choices or []:
+        if not isinstance(choice, dict):
+            continue
+        name = str(choice.get("name") or "").strip()[:80]
+        if not name:
+            continue
+        try:
+            cents = int(choice.get("price_cents", 0))
+        except (TypeError, ValueError):
+            raise ApiError(400, "Invalid choice price")
+        clean.append({"name": name, "price_cents": cents,
+                      "active": 0 if choice.get("active") in (0, False) else 1})
+    if not clean:
+        if group:
+            conn.execute("DELETE FROM product_modifier_groups WHERE modifier_group_id=?",
+                         (group["id"],))
+            conn.execute("DELETE FROM modifier_options WHERE modifier_group_id=?",
+                         (group["id"],))
+            conn.execute("DELETE FROM modifier_groups WHERE id=?", (group["id"],))
+        return
+    if group:
+        group_id = group["id"]
+    else:
+        group_id = conn.execute(
+            "INSERT INTO modifier_groups"
+            "(branch_id,name,selection_type,min_select,max_select,product_id)"
+            " VALUES(?,?,?,?,?,?)",
+            (branch_id, "__choices_%d" % product_id, "multi", 0, 50,
+             product_id)).lastrowid
+    existing = conn.execute(
+        "SELECT * FROM modifier_options WHERE modifier_group_id=? "
+        "ORDER BY sort_order,id", (group_id,)).fetchall()
+    for index, choice in enumerate(clean):
+        if index < len(existing):
+            conn.execute(
+                "UPDATE modifier_options SET name=?,price_delta_cents=?,"
+                "sort_order=?,active=? WHERE id=?",
+                (choice["name"], choice["price_cents"], index,
+                 choice["active"], existing[index]["id"]))
+        else:
+            conn.execute(
+                "INSERT INTO modifier_options"
+                "(modifier_group_id,name,price_delta_cents,sort_order,active)"
+                " VALUES(?,?,?,?,?)",
+                (group_id, choice["name"], choice["price_cents"], index,
+                 choice["active"]))
+    for option in existing[len(clean):]:
+        conn.execute("UPDATE modifier_options SET active=0 WHERE id=?",
+                     (option["id"],))
+    sort_order = conn.execute(
+        "SELECT COALESCE(MAX(sort_order),-1)+1 AS n FROM product_modifier_groups"
+        " WHERE product_id=?", (product_id,)).fetchone()["n"]
+    conn.execute(
+        "DELETE FROM product_modifier_groups WHERE product_id=? AND modifier_group_id=?",
+        (product_id, group_id))
+    conn.execute(
+        "INSERT INTO product_modifier_groups"
+        "(product_id,modifier_group_id,sort_order,override_min,override_max)"
+        " VALUES(?,?,?,NULL,NULL)", (product_id, group_id, sort_order))
 
 def h_catalog_sections(args, body, conn):
     branch_id = get_branch_id(body)
@@ -1460,35 +1584,55 @@ def h_catalog_products_list(args, body, conn):
 def h_catalog_product_create(args, body, conn):
     branch_id = get_branch_id(body)
     require_branch(conn, branch_id)
-    section_id = int(body.get("section_id") or 0)
-    if not conn.execute("SELECT 1 FROM sections WHERE id=? AND branch_id=?",
-                        (section_id, branch_id)).fetchone():
-        raise ApiError(400, "Bad section")
+    kind = body.get("kind", "item")
+    if kind not in ("group", "item"):
+        raise ApiError(400, "Invalid product kind")
+    parent_id = body.get("parent_id")
+    if parent_id in ("", 0, "0"):
+        parent_id = None
+    if parent_id is not None:
+        parent_id = int(parent_id)
+        parent = require_group_parent(conn, parent_id, branch_id)
+        section_id = int(parent["section_id"])
+    else:
+        section_id = int(body.get("section_id") or 0)
+        if not conn.execute("SELECT 1 FROM sections WHERE id=? AND branch_id=?",
+                            (section_id, branch_id)).fetchone():
+            raise ApiError(400, "Bad section")
     name = str(body.get("name") or "").strip()[:120]
     if not name:
         raise ApiError(400, "Product name required")
-    variants = validate_variants(conn, None, body.get("variants"))
+    attachments = body.get("modifier_groups") or []
+    if not isinstance(attachments, list):
+        raise ApiError(400, "Invalid modifier groups")
+    if kind == "group":
+        if body.get("variants"):
+            raise ApiError(400, "Sub-sections cannot have sizes")
+        if attachments:
+            raise ApiError(400, "Sub-sections cannot have choices")
+        variants = []
+    else:
+        variants = validate_variants(conn, None, body.get("variants"))
     try:
         conn.execute("BEGIN")
         cur = conn.execute(
-            "INSERT INTO products(section_id,name,description,image_path,active,sort_order)"
-            " VALUES(?,?,?,?,?,?)",
-            (section_id, name, str(body.get("description") or "")[:300],
+            "INSERT INTO products(section_id,parent_id,kind,name,description,image_path,"
+            "active,sort_order) VALUES(?,?,?,?,?,?,?,?)",
+            (section_id, parent_id, kind, name, str(body.get("description") or "")[:300],
              str(body.get("image_path") or "")[:500],
              int(bool(body.get("active", 1))),
              int(body.get("sort_order", 0))))
         product_id = cur.lastrowid
+        variant_ids = []
         for variant in variants:
-            conn.execute(
+            v = conn.execute(
                 "INSERT INTO product_variants"
                 "(product_id,name,price_cents,stock_qty,is_default,sort_order,active)"
                 " VALUES(?,?,?,?,?,?,?)",
                 (product_id, variant["name"], variant["price_cents"],
                  variant["stock_qty"], variant["is_default"],
                  variant["sort_order"], variant["active"]))
-        attachments = body.get("modifier_groups") or []
-        if not isinstance(attachments, list):
-            raise ApiError(400, "Invalid modifier groups")
+            variant_ids.append({"id": v.lastrowid, "name": variant["name"]})
         for attachment in attachments:
             if not isinstance(attachment, dict):
                 raise ApiError(400, "Invalid modifier group attachment")
@@ -1514,26 +1658,79 @@ def h_catalog_product_create(args, body, conn):
                 " VALUES(?,?,?,?,?)",
                 (product_id, group_id, int(attachment.get("sort_order", 0)),
                  override_min, override_max))
+        if "choices" in body:
+            if kind != "item":
+                raise ApiError(400, "Sub-sections cannot have choices")
+            sync_product_choices(conn, product_id, branch_id, body["choices"])
         bump_rev(conn)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-    return {"ok": True, "product_id": product_id}
+    return {"ok": True, "product_id": product_id, "variants": variant_ids}
 
 def h_catalog_product_update(args, body, conn):
     branch_id = get_branch_id(body)
     product_id = int(args[0])
-    require_product(conn, product_id, branch_id)
+    product = require_product(conn, product_id, branch_id)
     try:
         conn.execute("BEGIN")
-        if "section_id" in body:
+        kind = body.get("kind", product["kind"])
+        if kind not in ("group", "item"):
+            raise ApiError(400, "Invalid product kind")
+        parent_id = product["parent_id"]
+        if "parent_id" in body:
+            parent_id = body["parent_id"]
+            if parent_id in ("", 0, "0"):
+                parent_id = None
+            elif parent_id is not None:
+                parent_id = int(parent_id)
+                if parent_id == product_id:
+                    raise ApiError(400, "A menu item cannot be its own parent")
+                parent = require_group_parent(conn, parent_id, branch_id)
+                if parent_id in product_descendant_ids(conn, product_id):
+                    raise ApiError(400, "A menu item cannot be moved inside its own sub-tree")
+                section_id = int(parent["section_id"])
+                if "section_id" in body and int(body["section_id"]) != section_id:
+                    raise ApiError(400, "Section is determined by the parent")
+            else:
+                section_id = int(body.get("section_id", product["section_id"]))
+                if not conn.execute("SELECT 1 FROM sections WHERE id=? AND branch_id=?",
+                                    (section_id, branch_id)).fetchone():
+                    raise ApiError(400, "Bad section")
+        elif "section_id" in body:
             section_id = int(body["section_id"])
             if not conn.execute("SELECT 1 FROM sections WHERE id=? AND branch_id=?",
                                 (section_id, branch_id)).fetchone():
                 raise ApiError(400, "Bad section")
-            conn.execute("UPDATE products SET section_id=? WHERE id=?",
-                         (section_id, product_id))
+            if product["parent_id"] is not None:
+                parent = require_group_parent(conn, product["parent_id"], branch_id)
+                if section_id != int(parent["section_id"]):
+                    raise ApiError(400, "Section is determined by the parent")
+        else:
+            section_id = int(product["section_id"])
+        if parent_id is not None:
+            parent = require_group_parent(conn, parent_id, branch_id)
+            section_id = int(parent["section_id"])
+        descendants = product_descendant_ids(conn, product_id)
+        children = count_product_children(conn, product_id)
+        if kind == "item" and product["kind"] == "group" and children:
+            raise ApiError(409, "Sub-sections with children cannot become dishes")
+        if kind == "group":
+            has_variants = conn.execute(
+                "SELECT 1 FROM product_variants WHERE product_id=? LIMIT 1",
+                (product_id,)).fetchone()
+            has_choices = conn.execute(
+                "SELECT 1 FROM product_modifier_groups WHERE product_id=? LIMIT 1",
+                (product_id,)).fetchone()
+            if has_variants or has_choices or body.get("variants") or body.get("modifier_groups"):
+                raise ApiError(400, "Sub-sections cannot have sizes or choices")
+        if kind == "item" and product["kind"] == "group" and "variants" not in body:
+            raise ApiError(400, "A dish requires at least one size")
+        conn.executemany("UPDATE products SET section_id=? WHERE id=?",
+                         [(section_id, descendant_id) for descendant_id in descendants])
+        conn.execute("UPDATE products SET parent_id=?,kind=? WHERE id=?",
+                     (parent_id, kind, product_id))
         if "name" in body:
             name = str(body["name"] or "").strip()[:120]
             if not name:
@@ -1551,7 +1748,10 @@ def h_catalog_product_update(args, body, conn):
         if "sort_order" in body:
             conn.execute("UPDATE products SET sort_order=? WHERE id=?",
                          (int(body["sort_order"]), product_id))
+        variant_ids = []
         if "variants" in body:
+            if kind == "group":
+                raise ApiError(400, "Sub-sections cannot have sizes")
             variants = validate_variants(conn, product_id, body["variants"])
             existing_ids = {r["id"] for r in conn.execute(
                 "SELECT id FROM product_variants WHERE product_id=?",
@@ -1577,15 +1777,20 @@ def h_catalog_product_update(args, body, conn):
                         (variant["name"], variant["price_cents"], variant["stock_qty"],
                          variant["is_default"], variant["sort_order"],
                          variant["active"], int(variant["id"])))
+                    variant_id = int(variant["id"])
                 else:
-                    conn.execute(
+                    inserted = conn.execute(
                         "INSERT INTO product_variants"
                         "(product_id,name,price_cents,stock_qty,is_default,sort_order,active)"
                         " VALUES(?,?,?,?,?,?,?)",
                         (product_id, variant["name"], variant["price_cents"],
                          variant["stock_qty"], variant["is_default"],
                          variant["sort_order"], variant["active"]))
+                    variant_id = inserted.lastrowid
+                variant_ids.append({"id": variant_id, "name": variant["name"]})
         if "modifier_groups" in body:
+            if kind == "group" and body["modifier_groups"]:
+                raise ApiError(400, "Sub-sections cannot have choices")
             attachments = body["modifier_groups"]
             if not isinstance(attachments, list):
                 raise ApiError(400, "Invalid modifier groups")
@@ -1616,17 +1821,27 @@ def h_catalog_product_update(args, body, conn):
                     " VALUES(?,?,?,?,?)",
                     (product_id, group_id, int(attachment.get("sort_order", 0)),
                      override_min, override_max))
+        if "choices" in body:
+            if kind != "item":
+                raise ApiError(400, "Sub-sections cannot have choices")
+            sync_product_choices(conn, product_id, branch_id, body["choices"])
         bump_rev(conn)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-    return {"ok": True}
+    if not variant_ids:
+        variant_ids = [{"id": row["id"], "name": row["name"]} for row in conn.execute(
+            "SELECT id,name FROM product_variants WHERE product_id=? ORDER BY sort_order,id",
+            (product_id,))]
+    return {"ok": True, "variants": variant_ids}
 
 def h_catalog_product_delete(args, body, conn):
     branch_id = get_branch_id(body)
     product_id = int(args[0])
-    require_product(conn, product_id, branch_id)
+    product = require_product(conn, product_id, branch_id)
+    if product["kind"] == "group" and count_product_children(conn, product_id):
+        raise ApiError(409, "Sub-section still has children")
     referenced = conn.execute(
         "SELECT 1 FROM order_items WHERE variant_id IN "
         "(SELECT id FROM product_variants WHERE product_id=?) "
@@ -1636,6 +1851,14 @@ def h_catalog_product_delete(args, body, conn):
         raise ApiError(409, "Product is in use by an open ticket")
     conn.execute("UPDATE products SET deleted_at=? WHERE id=?",
                  (datetime.datetime.now().isoformat(), product_id))
+    for owned in conn.execute(
+            "SELECT id FROM modifier_groups WHERE product_id=?",
+            (product_id,)).fetchall():
+        conn.execute("DELETE FROM product_modifier_groups WHERE modifier_group_id=?",
+                     (owned["id"],))
+        conn.execute("DELETE FROM modifier_options WHERE modifier_group_id=?",
+                     (owned["id"],))
+        conn.execute("DELETE FROM modifier_groups WHERE id=?", (owned["id"],))
     bump_rev(conn)
     conn.commit()
     return {"ok": True}
@@ -1651,7 +1874,9 @@ def h_catalog_variants_list(args, body, conn):
 def h_catalog_variant_create(args, body, conn):
     branch_id = get_branch_id(body)
     product_id = int(args[0])
-    require_product(conn, product_id, branch_id)
+    product = require_product(conn, product_id, branch_id)
+    if product["kind"] != "item":
+        raise ApiError(400, "Sub-sections cannot have sizes")
     name = str(body.get("name") or "").strip()[:80]
     if not name:
         raise ApiError(400, "Variant name required")
@@ -1685,12 +1910,14 @@ def h_catalog_variant_update(args, body, conn):
     branch_id = get_branch_id(body)
     variant_id = int(args[0])
     row = conn.execute(
-        "SELECT v.*,p.id product_id FROM product_variants v "
+        "SELECT v.*,p.id product_id,p.kind product_kind FROM product_variants v "
         "JOIN products p ON p.id=v.product_id "
         "JOIN sections s ON s.id=p.section_id "
         "WHERE v.id=? AND s.branch_id=?", (variant_id, branch_id)).fetchone()
     if not row:
         raise ApiError(404, "Variant not found")
+    if row["product_kind"] != "item":
+        raise ApiError(400, "Sub-sections cannot have sizes")
     product_id = row["product_id"]
     if "is_default" in body and int(bool(body["is_default"])):
         conn.execute("UPDATE product_variants SET is_default=0 "
@@ -1740,7 +1967,9 @@ def h_catalog_variant_update(args, body, conn):
 def h_catalog_variants_replace(args, body, conn):
     branch_id = get_branch_id(body)
     product_id = int(args[0])
-    require_product(conn, product_id, branch_id)
+    product = require_product(conn, product_id, branch_id)
+    if product["kind"] != "item":
+        raise ApiError(400, "Sub-sections cannot have sizes")
     variants = validate_variants(conn, product_id, body.get("variants"))
     try:
         conn.execute("BEGIN")
@@ -1926,6 +2155,9 @@ def h_catalog_group_delete(args, body, conn):
         (group_id, branch_id)).fetchone()
     if not row:
         raise ApiError(404, "Modifier group not found")
+    conn.execute("DELETE FROM product_modifier_groups WHERE modifier_group_id=?",
+                 (group_id,))
+    conn.execute("DELETE FROM modifier_options WHERE modifier_group_id=?", (group_id,))
     conn.execute("DELETE FROM modifier_groups WHERE id=?", (group_id,))
     bump_rev(conn)
     conn.commit()
@@ -2022,7 +2254,9 @@ def h_catalog_option_delete(args, body, conn):
 def h_catalog_product_groups(args, body, conn):
     branch_id = get_branch_id(body)
     product_id = int(args[0])
-    require_product(conn, product_id, branch_id)
+    product = require_product(conn, product_id, branch_id)
+    if product["kind"] != "item":
+        raise ApiError(400, "Sub-sections cannot have choices")
     attachments = body.get("modifier_groups")
     if not isinstance(attachments, list):
         raise ApiError(400, "Modifier groups must be a list")
@@ -2130,17 +2364,107 @@ def h_branch_create(args, body, conn):
         for section in conn.execute(
                 "SELECT * FROM sections WHERE branch_id=? ORDER BY position, id", (source_id,)):
             new_section = conn.execute(
-                "INSERT INTO sections(name,position,active,branch_id,kitchen_station) VALUES(?,?,?,?,?)",
+                "INSERT INTO sections(name,position,active,branch_id,kitchen_station,image_path) "
+                "VALUES(?,?,?,?,?,?)",
                 (section["name"], section["position"], section["active"], new_id,
-                 section["kitchen_station"] if "kitchen_station" in section.keys() else ""))
+                 section["kitchen_station"] if "kitchen_station" in section.keys() else "",
+                 section["image_path"] if "image_path" in section.keys() else ""))
             section_map[section["id"]] = new_section.lastrowid
+        legacy_item_map = {}
         for item in conn.execute("SELECT * FROM items WHERE branch_id=?", (source_id,)):
             copied = conn.execute(
                 "INSERT INTO items(section_id,name,price,description,position,active,branch_id,"
                 "stock_qty,image_url,modifiers) VALUES(?,?,?,?,?,?,?,NULL,?,?)",
                 (section_map[item["section_id"]], item["name"], item["price"], item["description"],
                  item["position"], item["active"], new_id, item["image_url"], item["modifiers"]))
+            legacy_item_map[item["id"]] = copied.lastrowid
             sync_catalog_from_item(conn, copied.lastrowid)
+        product_map = {}
+        variant_map = {}
+        for source_item_id, copied_item_id in legacy_item_map.items():
+            source_mirror = conn.execute(
+                "SELECT product_id FROM catalog_migration_items WHERE item_id=?",
+                (source_item_id,)).fetchone()
+            copied_mirror = conn.execute(
+                "SELECT product_id FROM catalog_migration_items WHERE item_id=?",
+                (copied_item_id,)).fetchone()
+            if source_mirror and copied_mirror:
+                product_map[source_mirror["product_id"]] = copied_mirror["product_id"]
+                source_variants = conn.execute(
+                    "SELECT id FROM product_variants WHERE product_id=?",
+                    (source_mirror["product_id"],)).fetchall()
+                copied_variants = conn.execute(
+                    "SELECT id FROM product_variants WHERE product_id=?",
+                    (copied_mirror["product_id"],)).fetchall()
+                for source_variant, copied_variant in zip(source_variants, copied_variants):
+                    variant_map[source_variant["id"]] = copied_variant["id"]
+        nodes = conn.execute(
+            "WITH RECURSIVE tree(id,parent_id,depth) AS ("
+            " SELECT id,parent_id,0 FROM products WHERE section_id IN "
+            "(SELECT id FROM sections WHERE branch_id=?) AND parent_id IS NULL "
+            " AND deleted_at IS NULL"
+            " UNION ALL SELECT p.id,p.parent_id,tree.depth+1 FROM products p "
+            " JOIN tree ON p.parent_id=tree.id WHERE p.deleted_at IS NULL)"
+            " SELECT p.*,tree.depth FROM tree JOIN products p ON p.id=tree.id "
+            " ORDER BY tree.depth,p.sort_order,p.id", (source_id,)).fetchall()
+        for product in nodes:
+            if product["id"] in product_map:
+                continue
+            parent_id = product_map.get(product["parent_id"]) if product["parent_id"] is not None else None
+            copied = conn.execute(
+                "INSERT INTO products(section_id,parent_id,kind,name,description,image_path,"
+                "active,sort_order,deleted_at) VALUES(?,?,?,?,?,?,?,?,NULL)",
+                (section_map[product["section_id"]], parent_id, product["kind"],
+                 product["name"], product["description"], product["image_path"],
+                 product["active"], product["sort_order"]))
+            target_product_id = copied.lastrowid
+            product_map[product["id"]] = target_product_id
+            for variant in conn.execute(
+                    "SELECT * FROM product_variants WHERE product_id=? ORDER BY sort_order,id",
+                    (product["id"],)).fetchall():
+                copied_variant = conn.execute(
+                    "INSERT INTO product_variants"
+                    "(product_id,name,price_cents,stock_qty,is_default,sort_order,active,image_path)"
+                    " VALUES(?,?,?,?,?,?,?,?)",
+                    (target_product_id, variant["name"], variant["price_cents"], None,
+                     variant["is_default"], variant["sort_order"], variant["active"],
+                     variant["image_path"]))
+                variant_map[variant["id"]] = copied_variant.lastrowid
+        group_map = {}
+        for group in conn.execute(
+                "SELECT * FROM modifier_groups WHERE branch_id=? ORDER BY id",
+                (source_id,)).fetchall():
+            copied_group = conn.execute(
+                "INSERT INTO modifier_groups"
+                "(branch_id,name,selection_type,min_select,max_select,product_id)"
+                " VALUES(?,?,?,?,?,?)",
+                (new_id, group["name"], group["selection_type"],
+                 group["min_select"], group["max_select"],
+                 product_map.get(group["product_id"])
+                 if "product_id" in group.keys() and group["product_id"] is not None
+                 else None))
+            group_map[group["id"]] = copied_group.lastrowid
+            for option in conn.execute(
+                    "SELECT * FROM modifier_options WHERE modifier_group_id=? ORDER BY sort_order,id",
+                    (group["id"],)).fetchall():
+                conn.execute(
+                    "INSERT INTO modifier_options"
+                    "(modifier_group_id,name,price_delta_cents,sort_order,active)"
+                    " VALUES(?,?,?,?,?)",
+                    (group_map[group["id"]], option["name"], option["price_delta_cents"],
+                     option["sort_order"], option["active"]))
+        for source_product_id, copied_product_id in product_map.items():
+            for attachment in conn.execute(
+                    "SELECT * FROM product_modifier_groups WHERE product_id=?",
+                    (source_product_id,)).fetchall():
+                if attachment["modifier_group_id"] in group_map:
+                    conn.execute(
+                        "INSERT INTO product_modifier_groups"
+                        "(product_id,modifier_group_id,sort_order,override_min,override_max)"
+                        " VALUES(?,?,?,?,?)",
+                        (copied_product_id, group_map[attachment["modifier_group_id"]],
+                         attachment["sort_order"], attachment["override_min"],
+                         attachment["override_max"]))
         for staff in conn.execute("SELECT * FROM staff WHERE branch_id=?", (source_id,)):
             conn.execute(
                 "INSERT INTO staff(name,tables,active,branch_id,role,kitchen_station) VALUES(?,?,?,?,?,?)",
@@ -2620,6 +2944,59 @@ def h_product_image(args, body, conn):
     conn.commit()
     return {"ok": True, "image_url": image_url}
 
+def save_uploaded_catalog_image(body):
+    mime_types = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
+    extension = mime_types.get(body.get("mime"))
+    if not extension:
+        raise ApiError(400, "Upload PNG, JPEG, or WebP images")
+    try:
+        image = base64.b64decode(body.get("data") or "", validate=True)
+    except (ValueError, TypeError):
+        raise ApiError(400, "Invalid image data")
+    if not image or len(image) > 2_000_000:
+        raise ApiError(413, "Image must be between 1 byte and 2 MB")
+    valid_signature = (
+        (extension == "png" and image.startswith(b"\x89PNG\r\n\x1a\n")) or
+        (extension == "jpg" and image.startswith(b"\xff\xd8\xff")) or
+        (extension == "webp" and len(image) >= 12 and image[:4] == b"RIFF" and image[8:12] == b"WEBP")
+    )
+    if not valid_signature:
+        raise ApiError(400, "Image content does not match its format")
+    os.makedirs(IMAGES_DIR, exist_ok=True)
+    filename = "%s.%s" % (uuid.uuid4().hex, extension)
+    path = os.path.join(IMAGES_DIR, filename)
+    with open(path, "wb") as image_file:
+        image_file.write(image)
+    return "/item-images/" + filename
+
+def h_section_image(args, body, conn):
+    branch_id = get_branch_id(body)
+    section_id = int(args[0])
+    if not conn.execute("SELECT 1 FROM sections WHERE id=? AND branch_id=?",
+                        (section_id, branch_id)).fetchone():
+        raise ApiError(404, "Section not found")
+    image_url = save_uploaded_catalog_image(body)
+    conn.execute("UPDATE sections SET image_path=? WHERE id=? AND branch_id=?",
+                 (image_url, section_id, branch_id))
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True, "image_url": image_url}
+
+def h_variant_image(args, body, conn):
+    branch_id = get_branch_id(body)
+    variant_id = int(args[0])
+    if not conn.execute(
+            "SELECT 1 FROM product_variants v JOIN products p ON p.id=v.product_id "
+            "JOIN sections s ON s.id=p.section_id "
+            "WHERE v.id=? AND s.branch_id=? AND p.deleted_at IS NULL",
+            (variant_id, branch_id)).fetchone():
+        raise ApiError(404, "Variant not found")
+    image_url = save_uploaded_catalog_image(body)
+    conn.execute("UPDATE product_variants SET image_path=? WHERE id=?", (image_url, variant_id))
+    bump_rev(conn)
+    conn.commit()
+    return {"ok": True, "image_url": image_url}
+
 def h_settings(args, body, conn):
     global CONFIG
     allowed = ("restaurant_name", "currency", "printer_ip", "printer_port", "autoprint", "admin_pin", "port",
@@ -2726,7 +3103,12 @@ ROUTES = [
     ("GET",    r"^/api/reports/sales$",             h_sales,          True),
     ("PUT",    r"^/api/items/(\d+)/image$",         h_item_image,     True),
     ("PUT",    r"^/api/products/(\d+)/image$",      h_product_image,  True),
+    ("PUT",    r"^/api/sections/(\d+)/image$",      h_section_image,  True),
+    ("PUT",    r"^/api/variants/(\d+)/image$",      h_variant_image,  True),
 ]
+
+CATALOG_PATH_RE = re.compile(
+    r"^/api/(sections|products|variants|modifier-groups|modifier-options|items|branches)(/|$)")
 
 # ---------------------------------------------------------------- HTTP server
 
@@ -2947,7 +3329,9 @@ class Handler(BaseHTTPRequestHandler):
             if not match:
                 continue
             try:
-                body = (self._body(3_000_000 if re.match(r"^/api/items/\d+/image$", path) else 1_000_000)
+                body = (self._body(3_000_000 if re.match(
+                            r"^/api/(items|products|sections|variants)/\d+/image$", path)
+                        else 1_000_000)
                         if method in ("POST", "PUT", "PATCH", "DELETE")
                         else {"lang": (query or {}).get("lang", ["en"])[0],
                               "period": (query or {}).get("period", ["7d"])[0],
@@ -2975,6 +3359,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b)
                 else:
                     self._json(result)
+                if method != "GET" and CATALOG_PATH_RE.match(path):
+                    try:
+                        cat_conn = db()
+                        try:
+                            bump_catalog_rev(cat_conn)
+                            cat_conn.commit()
+                        finally:
+                            cat_conn.close()
+                    except Exception:
+                        pass
             except ApiError as e:
                 self._json({"ok": False, "error": e.msg}, e.code)
             except Exception as e:

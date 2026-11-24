@@ -24,14 +24,17 @@ Use `python3 build_app.py --check` in CI. The build reads `top.html`, `mid.html`
 - **Branches:** create a branch from Administration. Optionally copy the current menu
   and staff; copied items start with stock untracked. Orders, reservations, menu, staff,
   and reports are isolated by branch.
-- **Catalog:** the admin menu uses sections, products, variants, and reusable modifier
-  groups. Variant prices and stock are stored in cents/integer units. A legacy
-  `/api/items` read-only projection remains for compatibility.
+- **Catalog:** sections contain a free-depth tree of image-backed sub-sections and
+  dishes. Each dish has image-backed sizes and reusable choice groups; manage choice
+  groups and their price-delta options from the dish editor. Variant prices and stock
+  are stored in cents/integer units. A legacy `/api/items` read-only projection remains
+  for compatibility.
 - **Inventory:** a blank variant stock quantity means untracked stock. Tracked stock
   is decremented when an order is accepted and restored on cancellation. Every stock
   change is recorded in `stock_movements` in the same transaction.
 - **Modifiers and images:** modifier options belong to reusable groups and use integer
-  cent deltas. PNG, JPEG, and WebP product or legacy item uploads up to 2 MB are supported.
+  cent deltas. PNG, JPEG, and WebP section, sub-section, dish, size, or legacy item
+  uploads up to 2 MB are supported.
 - **Reservations:** record a guest, contact, date/time, party size, optional table, and
   status. These are staff-managed reservations, not a public booking calendar.
 - **Bills and payments:** waiters can request a bill. Admin can record cash, card, or

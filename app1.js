@@ -52,13 +52,14 @@ function parseTables(staffTables) {
 // ---------- persistent state ----------
 var S = {
   role: null, waiterId: null, data: null, rev: -1, skew: 0, online: true,
+  catalogRev: null,
   branchId: 1,
   tableNo: null, search: '', sectionFilter: 0, adminTab: 'sections',
-  adminItemFilter: 0, adminSearch: '', cart: {}, queue: [], seen: {}, pollT: null,
+  adminItemFilter: 0, adminSearch: '', adminNodePath: [], cart: {}, queue: [], seen: {}, pollT: null,
   adminPin: null, lang: 'fr',
   catalogProducts: [], catalogGroups: [], catalogLoadedFor: null, adminProductId: null,
-  waiterCatalogLoadedFor: null, waiterProducts: [], waiterGroups: {},
-  kitchenStation: null, kitchenStationFilter: null
+  waiterCatalogLoadedFor: null, waiterProducts: [], waiterGroups: {}, menuPath: [],
+  kitchenStation: null, kitchenStationFilter: null, adminKitchenStationFilter: ''
 };
 
 var I18N = {
@@ -75,6 +76,16 @@ var I18N = {
     noWaiters: 'Aucun serveur pour le moment.',
     noOpen: 'Aucun ticket ouvert pour cette table.', tickets: 'Tickets',
     all: 'Tout', menu: 'Menu', searchMenu: 'Rechercher dans le menu...', noDishes: 'Aucun plat trouvé.',
+    loading: 'Chargement…', menuHome: 'Rubriques', subSection: 'Sous-rubrique',
+    dish: 'Plat', addDish: 'Ajouter un plat', addSubSection: '＋ Sous-rubrique',
+    choices: 'Choix', manageChoices: 'Gérer les choix', singleChoice: 'Choix unique',
+    multipleChoice: 'Choix multiples', minChoices: 'Minimum', maxChoices: 'Maximum',
+    addOption: 'Ajouter une option', priceDelta: 'Supplément', childCount: 'sous-éléments',
+    menuPath: 'Chemin', soldOutShort: '86', from: 'À partir de', sizes: 'Tailles',
+    addSize: 'Ajouter une taille', order: 'Ordre', groupName: 'Nom du groupe',
+    addChoice: 'Ajouter un choix', choiceNamePlaceholder: 'ex. avec sauce piquante',
+    createGroup: 'Créer le groupe', noChoiceGroups: 'Aucun groupe de choix.',
+    noChildren: 'Aucun élément ici.', noOptions: 'Aucune option.',
     review: 'Voir la commande', reviewOrder: 'Vérifier la commande', keepEditing: 'Continuer les modifications',
     sendKitchen: 'Envoyer en cuisine', print: 'Imprimer', served: 'Servi', cancel: 'Annuler',
     ticket: 'Ticket', noteKitchen: 'Note pour la cuisine (allergie, timing...)',
@@ -149,7 +160,21 @@ var I18N = {
     refund: 'Rembourser', refundAmount: 'Montant à rembourser', paymentRefunded: 'Remboursement enregistré',
     staffPin: 'Code PIN (laisser vide = sans code)', staffRole: 'Rôle', kitchenStation: 'Poste cuisine',
     allStations: 'Tous les postes', enterStaffPin: 'Entrez votre code', waiterRoleLabel: 'Serveur',
-    kitchenRoleLabel: 'Cuisine', stationPick: 'Choisir votre poste'
+    kitchenRoleLabel: 'Cuisine', stationPick: 'Choisir votre poste',
+    kitchenConfig: 'Configuration cuisine', newKitchenStaff: 'Ajouter personnel cuisine',
+    editKitchenStaff: 'Modifier membre cuisine', kitchenStaff: 'Personnel de cuisine',
+    kitchenStations: 'Postes de travail', assignStaff: 'Affecter un membre',
+    assignStation: 'Changer de poste', stationSpecialty: 'Poste / Spécialité',
+    stationPlaceholder: 'ex. Pizza, Grill, Bar, Froid…',
+    menuSectionRouting: 'Routage des rubriques vers les postes',
+    routingHelp: 'Les commandes des plats de chaque rubrique seront envoyées au poste de cuisine correspondant.',
+    noKitchenStaffYet: 'Aucun membre de cuisine configuré pour le moment.',
+    noKitchenStationsYet: 'Aucun poste de travail défini pour le moment.',
+    selectStaffMember: 'Sélectionner un membre', selectStation: 'Sélectionner un poste',
+    newStationPrompt: 'Nom du nouveau poste :', stationStaffAssigned: 'Personnel affecté au poste ✓',
+    sectionStationUpdated: 'Poste de la rubrique mis à jour ✓', noStaffAssigned: 'Aucun membre assigné',
+    noSectionsRouted: 'Aucune rubrique routée', allKitchenStaff: 'Tous les membres',
+    unassigned: 'Non attribué', passwordSet: 'Code défini', noPassword: 'Sans code'
   },
   ar: {
     offline: 'غير متصل - يتم حفظ الطلبات على هذا الجهاز',
@@ -163,6 +188,16 @@ var I18N = {
     noWaiters: 'لا يوجد نادلون حاليا.',
     noOpen: 'لا توجد تذاكر مفتوحة لهذه الطاولة.', tickets: 'التذاكر',
     all: 'الكل', menu: 'قائمة الطعام', searchMenu: 'البحث في القائمة...', noDishes: 'لا توجد أطباق.',
+    loading: 'جارٍ التحميل…', menuHome: 'الأقسام', subSection: 'قسم فرعي',
+    dish: 'طبق', addDish: 'إضافة طبق', addSubSection: '＋ قسم فرعي',
+    choices: 'الخيارات', manageChoices: 'إدارة الخيارات', singleChoice: 'اختيار واحد',
+    multipleChoice: 'اختيارات متعددة', minChoices: 'الحد الأدنى', maxChoices: 'الحد الأقصى',
+    addOption: 'إضافة خيار', priceDelta: 'إضافة سعر', childCount: 'عناصر فرعية',
+    menuPath: 'المسار', soldOutShort: '86', from: 'ابتداءً من', sizes: 'الأحجام',
+    addSize: 'إضافة حجم', order: 'الترتيب', groupName: 'اسم المجموعة',
+    addChoice: 'إضافة خيار', choiceNamePlaceholder: 'مثال: مع صلصة حارة',
+    createGroup: 'إنشاء المجموعة', noChoiceGroups: 'لا توجد مجموعات خيارات.',
+    noChildren: 'لا توجد عناصر هنا.', noOptions: 'لا توجد خيارات.',
     review: 'مراجعة الطلب', reviewOrder: 'مراجعة الطلب', keepEditing: 'متابعة',
     sendKitchen: 'إرسال للمطبخ', print: 'طباعة', served: 'تم التقديم', cancel: 'إلغاء',
     ticket: 'تذكرة', noteKitchen: 'ملاحظة للمطبخ (حساسية، توقيت...)',
@@ -237,7 +272,21 @@ var I18N = {
     pageTitle: 'طلبات المطعم',
     staffPin: 'رمز PIN (اتركه فارغاً = بدون رمز)', staffRole: 'الدور', kitchenStation: 'محطة المطبخ',
     allStations: 'جميع المحطات', enterStaffPin: 'أدخل رمزك', waiterRoleLabel: 'نادل',
-    kitchenRoleLabel: 'مطبخ', stationPick: 'اختر محطتك'
+    kitchenRoleLabel: 'مطبخ', stationPick: 'اختر محطتك',
+    kitchenConfig: 'إعدادات المطبخ', newKitchenStaff: 'إضافة موظف مطبخ',
+    editKitchenStaff: 'تعديل موظف المطبخ', kitchenStaff: 'طاقم المطبخ',
+    kitchenStations: 'محطات المطبخ', assignStaff: 'تعيين موظف للمحطة',
+    assignStation: 'تغيير المحطة', stationSpecialty: 'المحطة / التخصص',
+    stationPlaceholder: 'مثال: بيتزا، مشويات، بار، سلطات…',
+    menuSectionRouting: 'توجيه أقسام القائمة للمحطات',
+    routingHelp: 'سيتم توجيه طلبات أطباق كل قسم إلى محطة المطبخ المقابلة.',
+    noKitchenStaffYet: 'لا يوجد موظفو مطبخ حتى الآن.',
+    noKitchenStationsYet: 'لا توجد محطات مطبخ محددة بعد.',
+    selectStaffMember: 'اختر الموظف', selectStation: 'اختر محطة',
+    newStationPrompt: 'اسم المحطة الجديدة:', stationStaffAssigned: 'تم تعيين الموظف للمحطة ✓',
+    sectionStationUpdated: 'تم تحديث توجيه القسم ✓', noStaffAssigned: 'لا يوجد موظف معين',
+    noSectionsRouted: 'لا توجد أقسام موجهة', allKitchenStaff: 'جميع موظفي المطبخ',
+    unassigned: 'غير معين', passwordSet: 'الرمز محدد', noPassword: 'بدون رمز'
   },
   en: {
     offline: 'Offline - orders are saved on this device',
@@ -251,6 +300,16 @@ var I18N = {
     noWaiters: 'No waiters yet.',
     noOpen: 'No open tickets for this table yet.', tickets: 'Tickets',
     all: 'All', menu: 'Menu', searchMenu: 'Search the menu...', noDishes: 'No dishes match.',
+    loading: 'Loading…', menuHome: 'Sections', subSection: 'Sub-section',
+    dish: 'Dish', addDish: '＋ Dish', addSubSection: '＋ Sub-section',
+    choices: 'Choices', manageChoices: 'Manage choices', singleChoice: 'Single choice',
+    multipleChoice: 'Multiple choices', minChoices: 'Minimum', maxChoices: 'Maximum',
+    addOption: 'Add option', priceDelta: 'Price delta', childCount: 'child items',
+    menuPath: 'Path', soldOutShort: '86', from: 'From', sizes: 'Sizes',
+    addSize: 'Add size', order: 'Order', groupName: 'Group name',
+    addChoice: 'Add choice', choiceNamePlaceholder: 'e.g. with hot sauce',
+    createGroup: 'Create group', noChoiceGroups: 'No choice groups.',
+    noChildren: 'Nothing in this section yet.', noOptions: 'No options yet.',
     review: 'Review order', reviewOrder: 'Review order', keepEditing: 'Keep editing',
     sendKitchen: 'Send to kitchen', print: 'Print', served: 'Served', cancel: 'Cancel',
     ticket: 'Ticket', noteKitchen: 'Note for the kitchen (allergy, timing...)',
@@ -325,7 +384,21 @@ var I18N = {
     pageTitle: 'Restaurant Orders',
     staffPin: 'PIN code (leave blank = no PIN)', staffRole: 'Role', kitchenStation: 'Kitchen station',
     allStations: 'All stations', enterStaffPin: 'Enter your code', waiterRoleLabel: 'Waiter',
-    kitchenRoleLabel: 'Kitchen', stationPick: 'Choose your station'
+    kitchenRoleLabel: 'Kitchen', stationPick: 'Choose your station',
+    kitchenConfig: 'Kitchen Config', newKitchenStaff: 'Add Kitchen Staff',
+    editKitchenStaff: 'Edit Kitchen Staff', kitchenStaff: 'Kitchen Staff',
+    kitchenStations: 'Kitchen Stations', assignStaff: 'Assign Staff',
+    assignStation: 'Assign Station', stationSpecialty: 'Station / Specialty',
+    stationPlaceholder: 'e.g. Pizza, Grill, Bar, Cold Kitchen…',
+    menuSectionRouting: 'Menu Sections Station Routing',
+    routingHelp: 'Orders for items in each section will be routed to that kitchen station.',
+    noKitchenStaffYet: 'No kitchen staff configured yet.',
+    noKitchenStationsYet: 'No kitchen stations defined yet.',
+    selectStaffMember: 'Select a staff member', selectStation: 'Select a station',
+    newStationPrompt: 'Enter new station name:', stationStaffAssigned: 'Staff assigned to station ✓',
+    sectionStationUpdated: 'Section routing updated ✓', noStaffAssigned: 'No staff assigned',
+    noSectionsRouted: 'No sections routed', allKitchenStaff: 'All Kitchen Staff',
+    unassigned: 'Unassigned', passwordSet: 'PIN set', noPassword: 'No PIN'
   }
 };
 var DATA_LABELS = {
@@ -443,6 +516,8 @@ function changeBranch(value) {
   S.waiterId = null; S.tableNo = null; S.cart = {};
   S.catalogLoadedFor = null; S.catalogProducts = []; S.catalogGroups = [];
   S.waiterCatalogLoadedFor = null; S.waiterProducts = []; S.waiterGroups = {};
+  S.adminItemFilter = 0; S.adminNodePath = []; S.adminProductId = null;
+  S.sectionFilter = 0; S.menuPath = [];
   sessionStorage.removeItem('ro_waiter'); saveLS('ro_cart', {});
   S.rev = -1; poll();
   if (S.role === 'admin' && S.adminTab === 'sales') loadSales(S.salesPeriod || '7d');
@@ -478,6 +553,11 @@ async function poll() {
     var wasOnline = S.online;
     S.online = true; S.data = j;
     S.skew = j.now - Date.now() / 1000;
+    if (j.catalog_rev !== undefined && j.catalog_rev !== S.catalogRev) {
+      S.catalogRev = j.catalog_rev;
+      S.waiterCatalogLoadedFor = null;
+      S.catalogLoadedFor = null;
+    }
     if (S.role === 'kitchen') detectNewOrders(j);
     var changed = j.rev !== S.rev;
     S.rev = j.rev;
@@ -541,7 +621,8 @@ function toast(msg) {
 function dlg(html) {
   var d = $('#dlg');
   d.innerHTML = '<div class="dlg-box">' + html + '</div>';
-  d.showModal(); return d;
+  if (!d.open) d.showModal();
+  return d;
 }
 function closeDlg() { var d = $('#dlg'); if (d.open) d.close(); d.innerHTML = ''; }
 function renderConn() {
@@ -699,7 +780,7 @@ function renderWaiter(app) {
   else renderWaiterHome(app, me);
 }
 function renderWaiterSelect(app) {
-  var staff = S.data ? S.data.staff.filter(function (s) { return s.active; }) : [];
+  var staff = S.data ? S.data.staff.filter(function (s) { return s.active && s.role !== 'kitchen'; }) : [];
   var btns = staff.map(function (s) {
     return '<button class="role" onclick="pickWaiter(' + s.id + ')"><span class="ricon">🧑‍🍽️</span>' + esc(s.name) + '</button>';
   }).join('');
@@ -710,7 +791,7 @@ function renderWaiterSelect(app) {
 }
 var staffPinBuf = '';
 function pickWaiter(id) {
-  var s = (S.data.staff || []).filter(function(x){return x.id===id;})[0];
+  var s = (S.data.staff || []).filter(function(x){return x.id===id && x.role !== 'kitchen';})[0];
   if (!s || !s.has_pin) { toast('This staff member needs a password set by the admin.'); return; }
   if (s && s.has_pin) {
     staffPinBuf = '';
@@ -781,4 +862,4 @@ function renderWaiterHome(app, me) {
            : '<div class="empty">' + tr('noTables') + '</div>') +
     '</div>';
 }
-function openTable(t) { S.tableNo = t; S.sectionFilter = 0; S.search = ''; render(); }
+function openTable(t) { S.tableNo = t; S.sectionFilter = 0; S.menuPath = []; S.search = ''; render(); }

@@ -8,7 +8,9 @@ function renderKitchen(app) {
   var orders = (S.data.orders || []).map(function(o) {
     if (!S.kitchenStation) return o;
     var copy = Object.assign({}, o);
-    copy.lines = (o.lines || []).filter(function(l){return l.kitchen_station === S.kitchenStation;});
+    copy.lines = (o.lines || []).filter(function(l){
+      return (l.kitchen_station || '').trim().toLowerCase() === (S.kitchenStation || '').trim().toLowerCase();
+    });
     var active = copy.lines.filter(function(l){return l.status !== 'cancelled';});
     if (!active.length) return null;
     copy.status = active.every(function(l){return l.status === 'ready' || l.status === 'served';}) ? 'ready' :
@@ -83,7 +85,9 @@ async function lineNext(orderId, lineId) {
 function renderAdmin(app) {
   if (!S.adminPin) { renderAdminGate(app); return; }
   var tabs = [
-    ['sections', '🗂 ' + tr('sections')], ['items', '🍽 ' + tr('menuTab')], ['waiters', '🧑‍🤝‍🧑 ' + tr('waiters')],
+    ['sections', '🗂 ' + tr('sections')], ['items', '🍽 ' + tr('menuTab')],
+    ['kitchen', '👨‍🍳 ' + tr('kitchenConfig')],
+    ['waiters', '🧑‍🤝‍🧑 ' + tr('waiters')],
     ['orders', '🧾 ' + tr('orders')], ['reservations', '🗓 ' + tr('reservations')],
     ['sales', '📈 ' + tr('sales')], ['branches', '🏢 ' + tr('branch')], ['settings', '⚙️ ' + tr('settings')]
   ];
@@ -94,6 +98,7 @@ function renderAdmin(app) {
   var body = '';
   if (S.adminTab === 'sections') body = adminSections();
   else if (S.adminTab === 'items') body = adminItems();
+  else if (S.adminTab === 'kitchen') body = adminKitchen();
   else if (S.adminTab === 'waiters') body = adminWaiters();
   else if (S.adminTab === 'orders') body = adminOrders();
   else if (S.adminTab === 'reservations') body = adminReservations();
@@ -159,14 +164,19 @@ function chk(id) { var e = document.getElementById(id); return !!(e && e.checked
 
 // ---- sections tab ----
 function adminSections() {
+  if (S.catalogLoadedFor !== S.branchId) {
+    loadCatalogEditor();
+    return '<div class="loading">' + tr('loading') + '</div>';
+  }
   var secs = (S.data.sections || []).slice().sort(function (a, b) { return a.position - b.position || a.id - b.id; });
   var rows = secs.map(function (s) {
-    var sectionItems = (S.data.items || []).filter(function (i) { return i.section_id === s.id; });
+    var sectionItems = S.catalogProducts.filter(function (i) {
+      return i.section_id === s.id && i.deleted_at == null;
+    });
     var n = sectionItems.length;
-    var cover = sectionItems.filter(function (i) { return i.image_url; })[0];
     return '<article class="admin-menu-tile">' +
       '<button class="admin-menu-photo" onclick="showSectionItems(' + s.id + ')" aria-label="Open ' + esc(localizedLabel(s.name)) + ' items">' +
-        (cover ? '<img src="' + esc(cover.image_url) + '" alt="' + esc(localizedLabel(s.name)) + '">' : '<span aria-hidden="true">🗂️</span>') +
+        (s.image_path ? '<img src="' + esc(s.image_path) + '" alt="' + esc(localizedLabel(s.name)) + '">' : '<span aria-hidden="true">🗂️</span>') +
         '<span class="admin-open-label">' + tr('viewSectionItems') + ' →</span>' +
       '</button>' +
       '<div class="admin-menu-info" onclick="showSectionItems(' + s.id + ')"><div class="admin-menu-name">' + esc(localizedLabel(s.name)) + '</div>' +
@@ -193,6 +203,9 @@ async function sectionDlg(id) {
   var s = id ? (S.data.sections || []).filter(function (x) { return x.id === id; })[0] : { name: '' };
   dlg('<h2>' + (id ? tr('renameSection') : tr('newSection')) + '</h2>' +
     '<input id="f-s-name" class="in" value="' + esc(localizedLabel(s.name)) + '" placeholder="' + tr('sectionPlaceholder') + '">' +
+    '<label class="f">' + tr('image') + '</label>' +
+    (s.image_path ? '<img class="admin-image" src="' + esc(s.image_path) + '" alt="">' : '') +
+    '<input id="f-s-image" class="in" type="file" accept="image/png,image/jpeg,image/webp">' +
     '<label class="f">Kitchen station</label><input id="f-s-station" class="in" value="' + esc(s.kitchen_station || '') + '" placeholder="Pizza, Chicken, Grill…">' +
     '<label class="f"><input type="checkbox" id="f-s-active"' + (s.active !== 0 ? ' checked' : '') + '> ' + tr('activeOnWaiter') + '</label>' +
     '<div class="dlg-foot"><button class="btn" onclick="closeDlg()">' + tr('cancel') + '</button>' +
@@ -204,8 +217,11 @@ async function saveSection(id) {
   if (!name) { toast(tr('nameRequired')); return; }
   try {
     var body = { name: name, kitchen_station: val('f-s-station'), active: chk('f-s-active') ? 1 : 0 };
+    var sectionId = id;
     if (id) await api('/api/sections/' + id, 'PUT', body);
-    else await api('/api/sections', 'POST', body);
+    else sectionId = (await api('/api/sections', 'POST', body)).section_id;
+    var file = document.getElementById('f-s-image').files[0];
+    if (file) await uploadCatalogImage(file, '/api/sections/' + sectionId + '/image');
     closeDlg(); toast(tr('saved')); poll();
   } catch (e) { toast(e.code ? e.message : tr('needConnection')); }
 }
@@ -239,6 +255,19 @@ async function doDeleteSection(id) {
   catch (e) { closeDlg(); toast(e.message); }
 }
 
+async function uploadCatalogImage(file, endpoint) {
+  if (file.size > 2000000) throw new Error('Image size must be at most 2 MB');
+  var dataUrl = await new Promise(function (resolve, reject) {
+    var reader = new FileReader();
+    reader.onload = function () { resolve(reader.result); };
+    reader.onerror = function () { reject(new Error('Could not read image')); };
+    reader.readAsDataURL(file);
+  });
+  return api(endpoint, 'PUT', {
+    mime: file.type, data: String(dataUrl).split(',')[1]
+  });
+}
+
 // ---- catalog items tab ----
 async function loadCatalogEditor() {
   var key = S.branchId;
@@ -260,71 +289,132 @@ function sectionName(id) {
   return s ? localizedLabel(s.name) : '?';
 }
 
+function adminCatalogPath(product) {
+  var names = [], current = product, guard = 0;
+  while (current && guard++ < 100) {
+    names.unshift(localizedLabel(current.name));
+    current = current.parent_id == null ? null : S.catalogProducts.filter(function (p) {
+      return p.id === current.parent_id;
+    })[0];
+  }
+  return names.join(' › ');
+}
+
 function adminItems() {
   if (S.catalogLoadedFor !== S.branchId) {
     loadCatalogEditor();
     return '<div class="loading">' + tr('loading') + '</div>';
   }
-  var q = S.adminSearch.trim().toLowerCase();
   var sections = (S.data.sections || []).slice().sort(function (a, b) {
     return (a.position || 0) - (b.position || 0) || a.id - b.id;
   });
-  var filtered = S.catalogProducts.filter(function (p) {
-    if (S.adminItemFilter && p.section_id !== S.adminItemFilter) return false;
-    return !q || (localizedLabel(p.name) + ' ' + p.name).toLowerCase().indexOf(q) >= 0;
-  });
-  if (S.adminProductId && !S.catalogProducts.some(function (p) { return p.id === S.adminProductId; })) {
+  var allProducts = S.catalogProducts.filter(function (p) { return p.deleted_at == null; });
+  if (S.adminProductId && !allProducts.some(function (p) { return p.id === S.adminProductId; })) {
     S.adminProductId = null;
   }
   var sectionHtml = sections.map(function (s) {
-    var count = S.catalogProducts.filter(function (p) {
+    var count = allProducts.filter(function (p) {
       return p.section_id === s.id && p.deleted_at == null;
     }).length;
-    return '<button class="catalog-pane-item ' + (S.adminItemFilter === s.id ? 'on' : '') +
-      '" onclick="setCatalogSection(' + s.id + ')"><span>' + esc(localizedLabel(s.name)) + '</span><span class="tag">' + count + '</span></button>';
+    return '<button class="catalog-root-item ' + (S.adminItemFilter === s.id ? 'on' : '') +
+      '" onclick="setCatalogSection(' + s.id + ')">' +
+      (s.image_path ? '<img src="' + esc(s.image_path) + '" alt="">' : '<span>🗂️</span>') +
+      '<span>' + esc(localizedLabel(s.name)) + '</span><span class="tag">' + count + '</span></button>';
   }).join('');
-  var productHtml = filtered.map(function (p) {
-    var defaultVariant = (p.variants || []).filter(function (v) { return v.is_default; })[0] ||
-      (p.variants || [])[0];
-    return '<button class="catalog-pane-item ' + (S.adminProductId === p.id ? 'on' : '') +
-      '" onclick="selectCatalogProduct(' + p.id + ')"><span>' +
-      esc(localizedLabel(p.name)) + '</span><span class="dim">' +
-      (defaultVariant ? money(defaultVariant.price_cents / 100) : '') + '</span></button>';
+  var section = sections.filter(function (s) { return s.id === S.adminItemFilter; })[0] || null;
+  var path = (S.adminNodePath || []).map(function (id) {
+    return allProducts.filter(function (p) { return p.id === id; })[0];
+  }).filter(Boolean);
+  if (!section || path.some(function (p) { return p.section_id !== section.id; })) {
+    path = [];
+    S.adminNodePath = [];
+  }
+  var query = S.adminSearch.trim().toLowerCase();
+  var currentParent = path.length ? path[path.length - 1] : null;
+  var nodes = allProducts.filter(function (p) {
+    if (query) return (localizedLabel(p.name) + ' ' + p.name + ' ' + adminCatalogPath(p))
+      .toLowerCase().indexOf(query) >= 0;
+    return section && p.section_id === section.id &&
+      p.parent_id === (currentParent ? currentParent.id : null);
+  });
+  var nodeHtml = nodes.map(function (p) {
+    var children = allProducts.filter(function (child) { return child.parent_id === p.id; }).length;
+    var variants = (p.variants || []).filter(function (v) { return v.active; });
+    var prices = variants.map(function (v) { return v.price_cents || 0; });
+    var price = prices.length ? money(Math.min.apply(Math, prices) / 100) : '';
+    var open = p.kind === 'group' ? 'openAdminGroup(' + p.id + ')' : 'selectCatalogProduct(' + p.id + ')';
+    return '<article class="admin-tree-card ' + (S.adminProductId === p.id ? 'on' : '') + '">' +
+      '<button class="admin-tree-photo" onclick="' + open + '">' +
+      (p.image_path ? '<img src="' + esc(p.image_path) + '" alt="">' :
+        '<span aria-hidden="true">' + (p.kind === 'group' ? '📁' : '🍽️') + '</span>') +
+      '</button><div class="admin-tree-info"><b>' + esc(localizedLabel(p.name)) + '</b>' +
+      '<span class="dim">' + (p.kind === 'group' ? children + ' ' + tr('childCount') : price) + '</span>' +
+      '<button class="btn small" onclick="selectCatalogProduct(' + p.id + ')">' + tr('editItem') + '</button>' +
+      '</div></article>';
   }).join('');
-  var product = S.catalogProducts.filter(function (p) { return p.id === S.adminProductId; })[0] || null;
+  var breadcrumbs = '<button class="btn small" onclick="adminNodeDepth(0)">' +
+    (section ? esc(localizedLabel(section.name)) : tr('allSections')) + '</button>';
+  path.forEach(function (node, index) {
+    breadcrumbs += '<span class="crumb-sep">›</span><button class="btn small" onclick="adminNodeDepth(' +
+      (index + 1) + ')">' + esc(localizedLabel(node.name)) + '</button>';
+  });
+  var product = allProducts.filter(function (p) { return p.id === S.adminProductId; })[0] || null;
   var editor = catalogProductEditor(product);
   return '<div class="searchrow"><input id="f-catalog-search" class="in" placeholder="' +
     tr('searchItems') + '" value="' + esc(S.adminSearch) +
-    '" oninput="setAdminSearch(this.value)">' +
-    '<button class="btn primary" onclick="selectCatalogProduct(0)">＋ ' + tr('newItem') + '</button></div>' +
+    '" oninput="setAdminSearch(this.value)"></div>' +
     '<div class="catalog-editor"><aside class="catalog-pane catalog-sections"><h3>' +
     tr('sections') + '</h3><button class="catalog-pane-item ' + (!S.adminItemFilter ? 'on' : '') +
     '" onclick="setCatalogSection(0)"><span>' + tr('allSections') + '</span></button>' +
-    sectionHtml + '</aside><aside class="catalog-pane catalog-products"><h3>' +
-    tr('menuTab') + '</h3><div>' + (productHtml || '<div class="empty">' + tr('noItemsMatch') + '</div>') +
-    '</div></aside><section class="catalog-pane catalog-product-editor">' +
+    sectionHtml + '</aside><section class="catalog-pane catalog-products"><div class="catalog-tree-head">' +
+    '<h3>' + tr('menuTab') + '</h3><div class="menu-breadcrumb">' + breadcrumbs + '</div>' +
+    (section ? '<div class="catalog-tree-actions"><button class="btn small" onclick="newCatalogNode(\'group\')">' +
+      tr('addSubSection') + '</button><button class="btn small primary" onclick="newCatalogNode(\'item\')">' +
+      tr('addDish') + '</button></div>' : '') + '</div>' +
+    '<div class="admin-tree-grid">' + (nodeHtml || '<div class="empty">' +
+      (query ? tr('noItemsMatch') : (section ? tr('noChildren') : tr('allSections'))) + '</div>') +
+    '</div></section><section class="catalog-pane catalog-product-editor">' +
     editor + '</section></div>';
 }
 
 function setCatalogSection(id) {
   S.adminItemFilter = parseInt(id) || 0;
+  S.adminNodePath = [];
   S.adminProductId = null;
   render();
 }
 
 function selectCatalogProduct(id) {
   S.adminProductId = id ? parseInt(id) : 0;
+  if (!id) S.adminCreatingKind = 'item';
   render();
 }
 
 function setAdminSearch(v) { S.adminSearch = v; render(); }
+function openAdminGroup(id) {
+  S.adminNodePath.push(parseInt(id, 10));
+  S.adminProductId = null;
+  S.adminSearch = '';
+  render();
+}
+function adminNodeDepth(depth) {
+  S.adminNodePath = (S.adminNodePath || []).slice(0, depth);
+  S.adminProductId = null;
+  S.adminSearch = '';
+  render();
+}
+function newCatalogNode(kind) {
+  S.adminCreatingKind = kind;
+  S.adminProductId = 0;
+  render();
+}
 
 function catalogVariantRows(product) {
   var variants = product ? (product.variants || []) : [{
     id: null, name: 'Regular', price_cents: 0, stock_qty: null,
     is_default: 1, sort_order: 0, active: 1
   }];
-  return variants.map(function (v, index) {
+  return variants.map(function (v) {
     return '<div class="catalog-variant-row" data-variant-id="' + (v.id || '') + '">' +
       '<input class="in catalog-v-name" value="' + esc(v.name || '') + '" placeholder="Name">' +
       '<input class="in catalog-v-price" type="number" min="0" step="0.01" inputmode="decimal" value="' +
@@ -333,6 +423,11 @@ function catalogVariantRows(product) {
       (v.stock_qty == null ? '' : v.stock_qty) + '" placeholder="Stock">' +
       '<label title="Default"><input class="catalog-v-default" type="radio" name="catalog-default"' +
       (v.is_default ? ' checked' : '') + '></label>' +
+      '<label class="catalog-v-active"><input class="catalog-v-enabled" type="checkbox"' +
+      (v.active ? ' checked' : '') + '> ' + tr('active') + '</label>' +
+      '<div class="catalog-v-image">' + (v.image_path ?
+        '<img class="admin-image" src="' + esc(v.image_path) + '" alt="">' : '') +
+        '<input class="in catalog-v-file" type="file" accept="image/png,image/jpeg,image/webp"></div>' +
       '<button type="button" class="btn small danger" onclick="removeCatalogVariant(this)">×</button>' +
       '</div>';
   }).join('');
@@ -340,9 +435,14 @@ function catalogVariantRows(product) {
 
 function catalogProductEditor(product) {
   if (S.adminProductId === 0 || (!S.adminProductId && !product)) {
+    var parent = (S.adminNodePath || []).length ?
+      S.catalogProducts.filter(function (p) {
+        return p.id === S.adminNodePath[S.adminNodePath.length - 1];
+      })[0] : null;
     product = {
-      id: null, section_id: S.adminItemFilter || (S.data.sections[0] || {}).id || 0,
-      name: '', description: '', image_path: '', active: 1,
+      id: null, kind: S.adminCreatingKind || 'item', parent_id: parent ? parent.id : null,
+      section_id: parent ? parent.section_id : (S.adminItemFilter || (S.data.sections[0] || {}).id || 0),
+      name: '', description: '', image_path: '', active: 1, sort_order: 0,
       variants: [{ id: null, name: 'Regular', price_cents: 0, stock_qty: null,
         is_default: 1, sort_order: 0, active: 1 }],
       modifier_groups: []
@@ -355,42 +455,84 @@ function catalogProductEditor(product) {
     return '<option value="' + s.id + '"' + (product.section_id === s.id ? ' selected' : '') +
       '>' + esc(localizedLabel(s.name)) + '</option>';
   }).join('');
-  var attached = {};
-  (product.modifier_groups || []).forEach(function (g) {
-    attached[g.modifier_group_id] = g;
-  });
-  var groupOptions = S.catalogGroups.map(function (g) {
-    var attachment = attached[g.id];
-    return '<label class="catalog-group-option"><input type="checkbox" value="' + g.id + '"' +
-      (attachment ? ' checked' : '') + '> ' + esc(g.name) +
-      '<span class="dim">' + (g.selection_type === 'single' ? 'choose 1' : 'up to ' + g.max_select) +
-      '</span><input class="in catalog-group-min" data-group-id="' + g.id +
-      '" type="number" min="0" value="' + (attachment && attachment.override_min != null ?
-        attachment.override_min : g.min_select) + '" title="Min">' +
-      '<input class="in catalog-group-max" data-group-id="' + g.id +
-      '" type="number" min="0" value="' + (attachment && attachment.override_max != null ?
-        attachment.override_max : g.max_select) + '" title="Max"></label>';
-  }).join('');
-  return '<h3>' + (product.id ? 'Edit product' : 'New product') + '</h3>' +
+  var folder = product.kind === 'group';
+  return '<h3>' + (product.id ? tr('editItem') : (folder ? tr('subSection') : tr('newItem'))) + '</h3>' +
     '<div id="catalog-product-error" class="error-text"></div>' +
     '<label class="f">Name</label><input id="catalog-p-name" class="in" value="' +
     esc(localizedLabel(product.name || '')) + '">' +
-    '<label class="f">Section</label><select id="catalog-p-section" class="in">' + sectionOptions + '</select>' +
-    '<label class="f">Description</label><textarea id="catalog-p-description" class="in" rows="3">' +
-    esc(product.description || '') + '</textarea>' +
-    '<label class="f">Image</label>' + (product.image_path ?
+    (product.parent_id == null ? '<label class="f">' + tr('section') +
+      '</label><select id="catalog-p-section" class="in">' + sectionOptions + '</select>' :
+      '<p class="dim">' + esc(adminCatalogPath(product)) + '</p>') +
+    (!folder ? '<label class="f">' + tr('description') + '</label><textarea id="catalog-p-description" class="in" rows="3">' +
+    esc(product.description || '') + '</textarea>' : '') +
+    '<label class="f">' + tr('image') + '</label>' + (product.image_path ?
       '<img class="admin-image" src="' + esc(product.image_path) + '" alt="">' : '') +
     '<input id="catalog-p-image" class="in" type="file" accept="image/png,image/jpeg,image/webp">' +
     '<label class="f"><input id="catalog-p-active" type="checkbox"' +
-    (product.active ? ' checked' : '') + '> Active</label>' +
-    '<h3 class="catalog-subhead">Variants</h3><div id="catalog-variants">' +
+    (product.active ? ' checked' : '') + '> ' + tr('activeOnWaiter') + '</label>' +
+    '<label class="f">' + tr('order') + '</label><input id="catalog-p-order" class="in" type="number" value="' +
+      (product.sort_order || 0) + '">' +
+    (!folder ? '<h3 class="catalog-subhead">' + tr('sizes') + '</h3><div id="catalog-variants">' +
     catalogVariantRows(product) + '</div>' +
-    '<button type="button" class="btn small" onclick="addCatalogVariant()">＋ Add variant</button>' +
-    '<h3 class="catalog-subhead">Modifier groups</h3><div class="catalog-groups">' +
-    (groupOptions || '<div class="dim">No modifier groups.</div>') + '</div>' +
+    '<button type="button" class="btn small" onclick="addCatalogVariant()">＋ ' + tr('addSize') + '</button>' +
+    '<h3 class="catalog-subhead">' + tr('choices') + '</h3><div id="catalog-choices">' +
+    catalogChoiceRows(product) + '</div>' +
+    '<button type="button" class="btn small" onclick="addCatalogChoice()">＋ ' + tr('addChoice') + '</button>' : '') +
     '<div class="dlg-foot">' +
     (product.id ? '<button class="btn danger" onclick="deleteCatalogProduct(' + product.id + ')">Delete</button>' : '') +
-    '<button class="btn primary" onclick="saveCatalogProduct(' + (product.id || 0) + ')">Save</button></div>';
+    '<button class="btn primary" onclick="saveCatalogProduct(' + (product.id || 0) + ')">' + tr('save') + '</button></div>';
+}
+
+function catalogOwnedGroup(product) {
+  if (!product || !product.id) return null;
+  var attachment = (product.modifier_groups || []).filter(function (a) {
+    var g = S.catalogGroups.filter(function (x) { return x.id === a.modifier_group_id; })[0];
+    return g && g.product_id === product.id;
+  })[0];
+  if (!attachment) return null;
+  return S.catalogGroups.filter(function (g) {
+    return g.id === attachment.modifier_group_id;
+  })[0] || null;
+}
+
+function catalogChoiceRowHtml(index, option) {
+  option = option || {};
+  return '<div class="catalog-choice-row">' +
+    '<span class="catalog-choice-num">' + (index + 1) + '</span>' +
+    '<input class="in catalog-c-name" value="' + esc(option.name || '') +
+    '" placeholder="' + tr('choiceNamePlaceholder') + '">' +
+    '<input class="in catalog-c-price" type="number" min="0" step="0.01" inputmode="decimal" value="' +
+    ((option.price_delta_cents || 0) / 100).toFixed(2) + '" placeholder="0.00">' +
+    '<button type="button" class="btn small danger" onclick="removeCatalogChoice(this)">×</button>' +
+    '</div>';
+}
+
+function catalogChoiceRows(product) {
+  var group = catalogOwnedGroup(product);
+  if (!group) return '';
+  return (group.options || []).filter(function (o) { return o.active; }).map(function (o, i) {
+    return catalogChoiceRowHtml(i, o);
+  }).join('');
+}
+
+function addCatalogChoice() {
+  var container = document.getElementById('catalog-choices');
+  if (!container) return;
+  container.insertAdjacentHTML('beforeend', catalogChoiceRowHtml(container.children.length));
+}
+
+function removeCatalogChoice(button) {
+  var row = button.closest('.catalog-choice-row');
+  if (row) row.remove();
+  renumberCatalogChoices();
+}
+
+function renumberCatalogChoices() {
+  var container = document.getElementById('catalog-choices');
+  if (!container) return;
+  Array.prototype.forEach.call(container.querySelectorAll('.catalog-choice-num'), function (el, i) {
+    el.textContent = i + 1;
+  });
 }
 
 function addCatalogVariant() {
@@ -401,6 +543,8 @@ function addCatalogVariant() {
     '<input class="in catalog-v-price" type="number" min="0" step="0.01" value="0" placeholder="Price">' +
     '<input class="in catalog-v-stock" type="number" min="0" step="1" value="" placeholder="Stock">' +
     '<label title="Default"><input class="catalog-v-default" type="radio" name="catalog-default"></label>' +
+    '<label class="catalog-v-active"><input class="catalog-v-enabled" type="checkbox" checked> ' + tr('active') + '</label>' +
+    '<div class="catalog-v-image"><input class="in catalog-v-file" type="file" accept="image/png,image/jpeg,image/webp"></div>' +
     '<button type="button" class="btn small danger" onclick="removeCatalogVariant(this)">×</button></div>');
 }
 
@@ -418,8 +562,11 @@ function catalogInlineError(message) {
 async function saveCatalogProduct(id) {
   var name = val('catalog-p-name');
   if (!name) { catalogInlineError(tr('nameRequired')); return; }
-  var rows = Array.prototype.slice.call(document.querySelectorAll('.catalog-variant-row'));
-  if (!rows.length) { catalogInlineError('Product requires at least one variant'); return; }
+  var editing = id ? S.catalogProducts.filter(function (p) { return p.id === id; })[0] : null;
+  var kind = editing ? editing.kind : (S.adminCreatingKind || 'item');
+  var rows = kind === 'group' ? [] :
+    Array.prototype.slice.call(document.querySelectorAll('.catalog-variant-row'));
+  if (kind === 'item' && !rows.length) { catalogInlineError('Product requires at least one variant'); return; }
   var defaults = 0;
   var names = {};
   var variants = rows.map(function (row) {
@@ -436,54 +583,75 @@ async function saveCatalogProduct(id) {
       stock_qty: stockText === '' ? null : parseInt(stockText, 10),
       is_default: isDefault,
       sort_order: rows.indexOf(row),
-      active: 1
+      active: row.querySelector('.catalog-v-enabled').checked ? 1 : 0
     };
   });
-  if (defaults !== 1) { catalogInlineError('Exactly one default variant is required'); return; }
-  if (variants.some(function (v) { return !v.name || v.price_cents < 0; })) {
+  if (kind === 'item' && defaults !== 1) { catalogInlineError('Exactly one default variant is required'); return; }
+  if (kind === 'item' && variants.some(function (v) { return !v.name || v.price_cents < 0; })) {
     catalogInlineError('Variant names and non-negative prices are required');
     return;
   }
-  if (Object.keys(names).some(function (n) { return !n || names[n] > 1; })) {
+  if (kind === 'item' && Object.keys(names).some(function (n) { return !n || names[n] > 1; })) {
     catalogInlineError('Variant names must be unique');
     return;
   }
-  var modifierGroups = [];
-  document.querySelectorAll('.catalog-group-option input[type="checkbox"]:checked').forEach(function (box) {
-    var groupId = parseInt(box.value, 10);
-    var minInput = document.querySelector('.catalog-group-min[data-group-id="' + groupId + '"]');
-    var maxInput = document.querySelector('.catalog-group-max[data-group-id="' + groupId + '"]');
-    modifierGroups.push({
-      modifier_group_id: groupId,
-      override_min: minInput && minInput.value !== '' ? parseInt(minInput.value, 10) : null,
-      override_max: maxInput && maxInput.value !== '' ? parseInt(maxInput.value, 10) : null,
-      sort_order: modifierGroups.length
+  var choices = [];
+  if (kind === 'item') {
+    document.querySelectorAll('.catalog-choice-row').forEach(function (row) {
+      var choiceName = row.querySelector('.catalog-c-name').value.trim();
+      if (!choiceName) return;
+      var choicePrice = parseFloat(row.querySelector('.catalog-c-price').value);
+      choices.push({
+        name: sourceLabel(choiceName),
+        price_cents: isFinite(choicePrice) ? Math.round(choicePrice * 100) : 0
+      });
     });
-  });
+  }
+  var modifierGroups = [];
+  if (kind === 'item' && editing) {
+    (editing.modifier_groups || []).forEach(function (attachment) {
+      var group = S.catalogGroups.filter(function (g) {
+        return g.id === attachment.modifier_group_id;
+      })[0];
+      if (group && group.product_id === editing.id) return;
+      modifierGroups.push({
+        modifier_group_id: attachment.modifier_group_id,
+        override_min: attachment.override_min != null ? attachment.override_min : null,
+        override_max: attachment.override_max != null ? attachment.override_max : null,
+        sort_order: modifierGroups.length
+      });
+    });
+  }
   var body = {
     name: sourceLabel(name),
-    section_id: parseInt(val('catalog-p-section'), 10),
-    description: val('catalog-p-description'),
+    kind: kind,
+    parent_id: editing ? editing.parent_id : ((S.adminNodePath || []).length ?
+      S.adminNodePath[S.adminNodePath.length - 1] : null),
+    section_id: parseInt(val('catalog-p-section'), 10) ||
+      (editing ? editing.section_id : S.adminItemFilter),
+    description: kind === 'item' ? val('catalog-p-description') : '',
     active: chk('catalog-p-active') ? 1 : 0,
-    variants: variants,
-    modifier_groups: modifierGroups
+    sort_order: parseInt(val('catalog-p-order'), 10) || 0
   };
+  if (kind === 'item') {
+    body.variants = variants;
+    body.modifier_groups = modifierGroups;
+    body.choices = choices;
+  }
   try {
     var productId = id;
-    if (id) await api('/api/products/' + id, 'PATCH', body);
-    else productId = (await api('/api/products', 'POST', body)).product_id;
+    var saved;
+    if (id) saved = await api('/api/products/' + id, 'PATCH', body);
+    else saved = await api('/api/products', 'POST', body);
+    if (!id) productId = saved.product_id;
     var file = document.getElementById('catalog-p-image').files[0];
-    if (file) {
-      if (file.size > 2000000) throw new Error('Image size must be at most 2 MB');
-      var dataUrl = await new Promise(function (resolve, reject) {
-        var reader = new FileReader();
-        reader.onload = function () { resolve(reader.result); };
-        reader.onerror = function () { reject(new Error('Could not read image')); };
-        reader.readAsDataURL(file);
-      });
-      await api('/api/products/' + productId + '/image', 'PUT', {
-        mime: file.type, data: String(dataUrl).split(',')[1]
-      });
+    if (file) await uploadCatalogImage(file, '/api/products/' + productId + '/image');
+    if (kind === 'item') {
+      for (var index = 0; index < (saved.variants || []).length; index++) {
+        var variant = saved.variants[index];
+        var imageFile = rows[index] && rows[index].querySelector('.catalog-v-file').files[0];
+        if (imageFile) await uploadCatalogImage(imageFile, '/api/variants/' + variant.id + '/image');
+      }
     }
     S.catalogLoadedFor = null;
     S.adminProductId = productId;
@@ -493,6 +661,7 @@ async function saveCatalogProduct(id) {
     catalogInlineError(e.code ? e.message : (e.message || tr('needConnection')));
   }
 }
+
 
 function deleteCatalogProduct(id) {
   dlg('<h2>' + tr('deleteQuestion') + '</h2><p class="dim">' + tr('pastTicketsKept') + '</p>' +
@@ -515,14 +684,399 @@ async function doDeleteCatalogProduct(id) {
   }
 }
 
+// ================= KITCHEN CONFIG =================
+function getKnownKitchenStations() {
+  var stations = {};
+  (S.data.sections || []).forEach(function (s) {
+    var st = (s.kitchen_station || s.name || '').trim();
+    if (st) stations[st] = true;
+  });
+  return Object.keys(stations).sort(function (a, b) { return a.localeCompare(b); });
+}
+
+function setKitchenFilter(f) {
+  S.adminKitchenStationFilter = f;
+  render();
+}
+
+function adminKitchen() {
+  var stations = getKnownKitchenStations();
+  var allStaff = S.data.staff || [];
+  var kitchenStaff = allStaff.filter(function (s) {
+    return s.role === 'kitchen';
+  });
+  var sections = S.data.sections || [];
+
+  // Group staff & sections by station for Station Cards
+  var staffByStation = {};
+  var sectionsByStation = {};
+  stations.forEach(function (st) {
+    staffByStation[st] = [];
+    sectionsByStation[st] = [];
+  });
+  var unassignedStaff = [];
+  var unassignedSections = [];
+
+  kitchenStaff.forEach(function (s) {
+    var st = (s.kitchen_station || '').trim().toLowerCase();
+    var found = false;
+    stations.forEach(function (stationName) {
+      if (!found && st === stationName.toLowerCase()) {
+        staffByStation[stationName].push(s);
+        found = true;
+      }
+    });
+    if (!found) unassignedStaff.push(s);
+  });
+
+  sections.forEach(function (sec) {
+    var st = (sec.kitchen_station || sec.name || '').trim().toLowerCase();
+    var found = false;
+    stations.forEach(function (stationName) {
+      if (!found && st === stationName.toLowerCase()) {
+        sectionsByStation[stationName].push(sec);
+        found = true;
+      }
+    });
+    if (!found) unassignedSections.push(sec);
+  });
+
+  // Station Cards HTML
+  var stationCardsHtml = '';
+  if (stations.length === 0) {
+    stationCardsHtml = '<div class="empty" style="grid-column:1/-1;">' + tr('noKitchenStationsYet') + '</div>';
+  } else {
+    stationCardsHtml = stations.map(function (st) {
+      var stStaff = staffByStation[st] || [];
+      var stSecs = sectionsByStation[st] || [];
+      var staffChips = stStaff.length ? stStaff.map(function (s) {
+        return '<span class="tag ' + (s.active ? 'on' : 'off') + '" title="' + (s.active ? tr('active') : tr('offDuty')) + '">' +
+          '👨‍🍳 ' + esc(s.name) + (s.has_pin ? ' 🔒' : '') + '</span>';
+      }).join(' ') : '<span class="dim" style="font-size:12px;">' + tr('noStaffAssigned') + '</span>';
+
+      var secChips = stSecs.length ? stSecs.map(function (sec) {
+        return '<span class="tag">🗂 ' + esc(localizedLabel(sec.name)) + '</span>';
+      }).join(' ') : '<span class="dim" style="font-size:12px;">' + tr('noSectionsRouted') + '</span>';
+
+      return '<div class="station-card">' +
+        '<div class="station-card-head">' +
+          '<div class="station-card-title">🍳 ' + esc(st) + '</div>' +
+          '<button class="btn small" onclick="assignStaffDlg(\'' + esc(st).replace(/'/g, "\\'") + '\')">＋ ' + tr('assignStaff') + '</button>' +
+        '</div>' +
+        '<div class="station-card-meta">' +
+          '<b>' + tr('assignedStaff') + ' (' + stStaff.length + '):</b>' +
+          '<div class="station-card-tags">' + staffChips + '</div>' +
+        '</div>' +
+        '<div class="station-card-meta">' +
+          '<b>' + tr('assignedSections') + ' (' + stSecs.length + '):</b>' +
+          '<div class="station-card-tags">' + secChips + '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  }
+
+  // Filter staff if a station filter is chosen
+  var activeFilter = S.adminKitchenStationFilter || '';
+  var filteredStaff = kitchenStaff;
+  if (activeFilter) {
+    if (activeFilter === '__unassigned__') {
+      filteredStaff = unassignedStaff;
+    } else {
+      filteredStaff = kitchenStaff.filter(function (s) { return (s.kitchen_station || '').trim() === activeFilter; });
+    }
+  }
+
+  // Staff rows
+  var staffRows = filteredStaff.map(function (s) {
+    var st = (s.kitchen_station || '').trim();
+    return '<div class="row">' +
+      '<span class="rname grow">👨‍🍳 ' + esc(s.name) + '</span>' +
+      '<span class="tag" style="font-weight:700;">' + (st ? '🍳 ' + esc(st) : '<span style="color:#dc2626;">⚠ ' + tr('unassigned') + '</span>') + '</span>' +
+      '<button class="btn small" onclick="quickStationDlg(' + s.id + ')" title="' + tr('assignStation') + '">🔄 ' + tr('assignStation') + '</button>' +
+      '<span class="tag">' + (s.has_pin ? '🔒 ' + tr('passwordSet') : '⚠ ' + tr('noPassword')) + '</span>' +
+      '<span class="tag ' + (s.active ? 'on' : 'off') + '">' + (s.active ? tr('active') : tr('offDuty')) + '</span>' +
+      '<button class="btn small" onclick="toggleStaff(' + s.id + ',' + (s.active ? 0 : 1) + ')">' + (s.active ? tr('offDuty') : tr('onDuty')) + '</button>' +
+      '<button class="btn small" onclick="kitchenStaffDlg(' + s.id + ')" title="' + tr('edit') + '">✎</button>' +
+      '<button class="btn small danger" onclick="deleteStaff(' + s.id + ')" title="' + tr('delete') + '">🗑</button>' +
+      '</div>';
+  }).join('');
+
+  // Station filter chips
+  var filterChips = '<div class="chips searchrow" style="overflow-x:auto;padding-bottom:4px;margin-bottom:12px;">' +
+    '<button class="btn small ' + (!activeFilter ? 'on' : '') + '" onclick="setKitchenFilter(\'\')">' + tr('allKitchenStaff') + ' (' + kitchenStaff.length + ')</button>' +
+    stations.map(function (st) {
+      var count = (staffByStation[st] || []).length;
+      return '<button class="btn small ' + (activeFilter === st ? 'on' : '') + '" onclick="setKitchenFilter(\'' + esc(st).replace(/'/g, "\\'") + '\')">' +
+        '🍳 ' + esc(st) + ' (' + count + ')</button>';
+    }).join('') +
+    (unassignedStaff.length ? '<button class="btn small ' + (activeFilter === '__unassigned__' ? 'on' : '') + '" onclick="setKitchenFilter(\'__unassigned__\')">⚠ ' + tr('unassigned') + ' (' + unassignedStaff.length + ')</button>' : '') +
+  '</div>';
+
+  // Section Routing Rows
+  var sectionRows = sections.map(function (sec) {
+    var curStation = (sec.kitchen_station || '').trim();
+    var options = '<option value="">-- ' + tr('unassigned') + ' --</option>' +
+      stations.map(function (st) {
+        return '<option value="' + esc(st) + '"' + (curStation === st ? ' selected' : '') + '>🍳 ' + esc(st) + '</option>';
+      }).join('') +
+      '<option value="__new__">＋ ' + tr('stationPick') + '...</option>';
+
+    return '<div class="kitchen-routing-row">' +
+      '<div style="display:flex;align-items:center;gap:10px;">' +
+        (sec.image_path ? '<img src="' + esc(sec.image_path) + '" style="width:36px;height:36px;border-radius:8px;object-fit:cover;">' : '<span style="font-size:24px;">🗂</span>') +
+        '<div><b>' + esc(localizedLabel(sec.name)) + '</b></div>' +
+      '</div>' +
+      '<div style="display:flex;align-items:center;gap:8px;">' +
+        '<label class="dim" style="font-size:13px;">' + tr('kitchenStation') + ':</label>' +
+        '<select class="in small" style="min-width:160px;padding:6px 8px;" onchange="changeSectionStation(' + sec.id + ', this.value)">' +
+          options +
+        '</select>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+
+  return '<div class="fabrow" style="gap:8px;flex-wrap:wrap;justify-content:space-between;align-items:center;">' +
+      '<div><h2 style="margin:0;font-size:20px;">👨‍🍳 ' + tr('kitchenConfig') + '</h2>' +
+      '<p class="dim" style="margin:4px 0 0;font-size:13.5px;">' + tr('routingHelp') + '</p></div>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
+        '<button class="btn primary" onclick="kitchenStaffDlg(0)">＋ ' + tr('newKitchenStaff') + '</button>' +
+        '<button class="btn" onclick="assignStaffDlg()">👤 ' + tr('assignStaff') + '</button>' +
+      '</div>' +
+    '</div>' +
+
+    '<div class="kitchen-section-title">' +
+      '<span>🍳 ' + tr('kitchenStations') + '</span>' +
+    '</div>' +
+    '<div class="station-grid">' + stationCardsHtml + '</div>' +
+
+    '<div class="kitchen-section-title">' +
+      '<span>👨‍🍳 ' + tr('kitchenStaff') + ' (' + filteredStaff.length + ')</span>' +
+      '<button class="btn small primary" onclick="kitchenStaffDlg(0)">＋ ' + tr('newKitchenStaff') + '</button>' +
+    '</div>' +
+    filterChips +
+    '<div class="rows" style="margin-bottom:24px;">' + (staffRows || '<div class="empty">' + tr('noKitchenStaffYet') + '</div>') + '</div>' +
+
+    '<div class="kitchen-section-title">' +
+      '<span>🗂 ' + tr('menuSectionRouting') + '</span>' +
+    '</div>' +
+    '<p class="dim" style="margin:-4px 0 10px;font-size:13px;">' + tr('routingHelp') + '</p>' +
+    '<div class="rows">' + (sectionRows || '<div class="empty">' + tr('noSections') + '</div>') + '</div>';
+}
+
+function kitchenStaffDlg(id) {
+  var s = id ? (S.data.staff || []).filter(function (x) { return x.id === id; })[0]
+             : { name: '', role: 'kitchen', kitchen_station: '', active: 1, tables: '[]' };
+  var sections = S.data.sections || [];
+  var curStation = (s.kitchen_station || '').trim().toLowerCase();
+  var sectionOptions = '';
+  if (!sections.length) {
+    sectionOptions = '<option value="">-- No sections available (create sections first) --</option>';
+  } else {
+    sectionOptions = '<option value="">-- ' + tr('selectStation') + ' --</option>' +
+      sections.map(function (sec) {
+        var secName = (sec.name || '').trim();
+        var secVal = (sec.kitchen_station || secName).trim();
+        var isSelected = curStation && (curStation === secVal.toLowerCase() || curStation === secName.toLowerCase());
+        return '<option value="' + esc(secVal) + '"' + (isSelected ? ' selected' : '') + '>' +
+          '🗂 ' + esc(localizedLabel(sec.name)) +
+          '</option>';
+      }).join('');
+  }
+
+  dlg('<h2>' + (id ? tr('editKitchenStaff') : tr('newKitchenStaff')) + '</h2>' +
+    '<label class="f">' + tr('name') + '</label>' +
+    '<input id="f-ks-name" class="in" value="' + esc(s.name) + '" placeholder="e.g. Chef Mario">' +
+    '<label class="f">' + tr('stationSpecialty') + '</label>' +
+    '<select id="f-ks-station" class="in">' + sectionOptions + '</select>' +
+    '<label class="f">' + (id ? 'New PIN (leave blank to keep current)' : 'PIN (4–8 digits)') + '</label>' +
+    '<input id="f-ks-pin" class="in" type="password" inputmode="numeric" autocomplete="new-password" placeholder="••••">' +
+    '<label class="f"><input type="checkbox" id="f-ks-active"' + (s.active ? ' checked' : '') + '> ' + tr('onDutyLabel') + '</label>' +
+    '<p id="f-ks-error" class="error-text" role="alert"></p>' +
+    '<div class="dlg-foot"><button class="btn" onclick="closeDlg()">' + tr('cancel') + '</button>' +
+    '<button class="btn primary" onclick="saveKitchenStaff(' + (id || 0) + ')">' + tr('save') + '</button></div>');
+  var el = document.getElementById('f-ks-name'); if (el) el.focus();
+}
+
+async function saveKitchenStaff(id) {
+  var name = val('f-ks-name').trim();
+  if (!name) { var e = document.getElementById('f-ks-error'); if (e) e.textContent = tr('nameRequired'); return; }
+  var station = val('f-ks-station').trim();
+  if (!station) { var e = document.getElementById('f-ks-error'); if (e) e.textContent = 'Please choose a section from the scroll menu.'; return; }
+  var pin = val('f-ks-pin').trim();
+  if (!id && !/^\d{4,8}$/.test(pin)) {
+    var e = document.getElementById('f-ks-error');
+    if (e) e.textContent = 'Set a 4–8 digit PIN so this staff member can unlock their station tablet.';
+    return;
+  }
+  if (pin && !/^\d{4,8}$/.test(pin)) {
+    var e = document.getElementById('f-ks-error');
+    if (e) e.textContent = 'PIN must be 4–8 digits.';
+    return;
+  }
+  var body = {
+    name: name,
+    role: 'kitchen',
+    kitchen_station: station,
+    active: chk('f-ks-active') ? 1 : 0
+  };
+  if (!id) body.tables = [];
+  if (pin) body.pin = pin;
+
+  try {
+    if (id) await api('/api/staff/' + id, 'PUT', body);
+    else await api('/api/staff', 'POST', body);
+    closeDlg();
+    toast(tr('saved'));
+    poll();
+  } catch (err) {
+    var e = document.getElementById('f-ks-error');
+    if (e) e.textContent = err.message || tr('needConnection');
+  }
+}
+
+function assignStaffDlg(defaultStation) {
+  var staff = S.data.staff || [];
+  var sections = S.data.sections || [];
+  var curStation = (defaultStation || '').trim().toLowerCase();
+
+  var staffOptions = staff.map(function(s) {
+    var roleLabel = s.role === 'kitchen' ? ('🍳 ' + (s.kitchen_station || tr('unassigned'))) : '🧑‍🍽️ Waiter';
+    return '<option value="' + s.id + '">' + esc(s.name) + ' (' + roleLabel + ')</option>';
+  }).join('');
+
+  var sectionOptions = '';
+  if (!sections.length) {
+    sectionOptions = '<option value="">-- No sections available --</option>';
+  } else {
+    sectionOptions = '<option value="">-- ' + tr('selectStation') + ' --</option>' +
+      sections.map(function (sec) {
+        var secName = (sec.name || '').trim();
+        var secVal = (sec.kitchen_station || secName).trim();
+        var isSelected = curStation && (curStation === secVal.toLowerCase() || curStation === secName.toLowerCase());
+        return '<option value="' + esc(secVal) + '"' + (isSelected ? ' selected' : '') + '>' +
+          '🗂 ' + esc(localizedLabel(sec.name)) +
+          '</option>';
+      }).join('');
+  }
+
+  dlg('<h2>' + tr('assignStaff') + '</h2>' +
+    '<label class="f">' + tr('selectStaffMember') + '</label>' +
+    '<select id="f-as-staff" class="in">' + (staffOptions || '<option value="">-- No staff members --</option>') + '</select>' +
+    '<label class="f">' + tr('stationSpecialty') + '</label>' +
+    '<select id="f-as-station" class="in">' + sectionOptions + '</select>' +
+    '<label class="f">PIN (required if not set yet, 4–8 digits)</label>' +
+    '<input id="f-as-pin" class="in" type="password" inputmode="numeric" placeholder="••••">' +
+    '<p id="f-as-error" class="error-text" role="alert"></p>' +
+    '<div class="dlg-foot"><button class="btn" onclick="closeDlg()">' + tr('cancel') + '</button>' +
+    '<button class="btn primary" onclick="saveAssignStaff()">' + tr('assignStaff') + '</button></div>');
+}
+
+async function saveAssignStaff() {
+  var staffId = parseInt(val('f-as-staff'), 10);
+  if (!staffId) {
+    var e = document.getElementById('f-as-error');
+    if (e) e.textContent = 'Please select a staff member.';
+    return;
+  }
+  var station = val('f-as-station').trim();
+  if (!station) {
+    var e = document.getElementById('f-as-error');
+    if (e) e.textContent = 'Please choose a section from the scroll menu.';
+    return;
+  }
+  var pin = val('f-as-pin').trim();
+  var staffMember = (S.data.staff || []).filter(function(s){ return s.id === staffId; })[0];
+  if (staffMember && !staffMember.has_pin && !pin) {
+    var e = document.getElementById('f-as-error');
+    if (e) e.textContent = 'This staff member needs a 4–8 digit PIN to unlock kitchen tablets.';
+    return;
+  }
+  if (pin && !/^\d{4,8}$/.test(pin)) {
+    var e = document.getElementById('f-as-error');
+    if (e) e.textContent = 'PIN must be 4–8 digits.';
+    return;
+  }
+
+  var body = {
+    role: 'kitchen',
+    kitchen_station: station
+  };
+  if (pin) body.pin = pin;
+
+  try {
+    await api('/api/staff/' + staffId, 'PUT', body);
+    closeDlg();
+    toast(tr('stationStaffAssigned'));
+    poll();
+  } catch(err) {
+    var e = document.getElementById('f-as-error');
+    if (e) e.textContent = err.message || tr('needConnection');
+  }
+}
+
+function quickStationDlg(staffId) {
+  var s = (S.data.staff || []).filter(function(x){ return x.id === staffId; })[0];
+  if (!s) return;
+  var sections = S.data.sections || [];
+  var curStation = (s.kitchen_station || '').trim().toLowerCase();
+
+  var sectionOptions = '';
+  if (!sections.length) {
+    sectionOptions = '<option value="">-- No sections available --</option>';
+  } else {
+    sectionOptions = '<option value="">-- ' + tr('selectStation') + ' --</option>' +
+      sections.map(function (sec) {
+        var secName = (sec.name || '').trim();
+        var secVal = (sec.kitchen_station || secName).trim();
+        var isSelected = curStation && (curStation === secVal.toLowerCase() || curStation === secName.toLowerCase());
+        return '<option value="' + esc(secVal) + '"' + (isSelected ? ' selected' : '') + '>' +
+          '🗂 ' + esc(localizedLabel(sec.name)) +
+          '</option>';
+      }).join('');
+  }
+
+  dlg('<h2>' + tr('assignStation') + ' — ' + esc(s.name) + '</h2>' +
+    '<label class="f">' + tr('stationSpecialty') + '</label>' +
+    '<select id="f-qs-station" class="in">' + sectionOptions + '</select>' +
+    '<div class="dlg-foot"><button class="btn" onclick="closeDlg()">' + tr('cancel') + '</button>' +
+    '<button class="btn primary" onclick="saveQuickStation(' + staffId + ')">' + tr('save') + '</button></div>');
+}
+
+async function saveQuickStation(staffId) {
+  var station = val('f-qs-station').trim();
+  try {
+    await api('/api/staff/' + staffId, 'PUT', { role: 'kitchen', kitchen_station: station });
+    closeDlg();
+    toast(tr('stationStaffAssigned'));
+    poll();
+  } catch(err) {
+    toast(err.message || tr('needConnection'));
+  }
+}
+
+async function changeSectionStation(sectionId, station) {
+  if (station === '__new__') {
+    var name = prompt(tr('newStationPrompt'));
+    if (!name || !name.trim()) { render(); return; }
+    station = name.trim();
+  }
+  try {
+    await api('/api/sections/' + sectionId, 'PUT', { kitchen_station: station });
+    toast(tr('sectionStationUpdated'));
+    poll();
+  } catch(err) {
+    toast(err.message || tr('needConnection'));
+  }
+}
+
 // ---- waiters tab ----
 function adminWaiters() {
-  var rows = (S.data.staff || []).map(function (s) {
+  var waiters = (S.data.staff || []).filter(function (s) { return s.role !== 'kitchen'; });
+  var rows = waiters.map(function (s) {
     var chips = parseTables(s.tables).map(function (t) { return '<span class="tag">' + t + '</span>'; }).join(' ');
     return '<div class="row">' +
-      '<span class="rname grow">' + esc(s.name) + '</span>' +
-      '<span class="tag">' + (s.role === 'kitchen' ? '🍳 ' + esc(s.kitchen_station || 'Kitchen') : '🧑‍🍽️ Waiter') + '</span>' +
-      '<span class="tag">' + (s.has_pin ? '🔒 Password set' : '⚠ No password') + '</span>' +
+      '<span class="rname grow">🧑‍🍽️ ' + esc(s.name) + '</span>' +
+      '<span class="tag">' + (s.has_pin ? '🔒 ' + tr('passwordSet') : '⚠ ' + tr('noPassword')) + '</span>' +
       '<span>' + (chips || '<span class="tag">' + tr('noTablesShort') + '</span>') + '</span>' +
       '<span class="tag ' + (s.active ? 'on' : 'off') + '">' + (s.active ? tr('active') : tr('offDuty')) + '</span>' +
       '<button class="btn small" onclick="toggleStaff(' + s.id + ',' + (s.active ? 0 : 1) + ')">' + (s.active ? tr('offDuty') : tr('onDuty')) + '</button>' +
@@ -535,13 +1089,11 @@ function adminWaiters() {
     '<div class="rows">' + (rows || '<div class="empty">' + tr('noWaitersYet') + '</div>') + '</div>';
 }
 function waiterDlg(id) {
-  var s = id ? (S.data.staff || []).filter(function (x) { return x.id === id; })[0]
+  var s = id ? (S.data.staff || []).filter(function (x) { return x.id === id && x.role !== 'kitchen'; })[0]
              : { name: '', tables: '[]', active: 1, role:'waiter', kitchen_station:'' };
   var tstr = parseTables(s.tables).join(', ');
   dlg('<h2>' + (id ? tr('editWaiter') : tr('newWaiter')) + '</h2>' +
     '<label class="f">' + tr('name') + '</label><input id="f-w-name" class="in" value="' + esc(s.name) + '" placeholder="' + tr('waiterNamePlaceholder') + '">' +
-    '<label class="f">Role</label><select id="f-w-role" class="in" onchange="toggleKitchenFields()"><option value="waiter"' + (s.role !== 'kitchen' ? ' selected' : '') + '>Waiter</option><option value="kitchen"' + (s.role === 'kitchen' ? ' selected' : '') + '>Kitchen staff</option></select>' +
-    '<div id="f-w-kitchen-fields"' + (s.role === 'kitchen' ? '' : ' style="display:none"') + '><label class="f">Specialty / station</label><input id="f-w-station" class="in" value="' + esc(s.kitchen_station || '') + '" placeholder="Pizza, Chicken, Grill…"></div>' +
     '<label class="f">' + (id ? 'New PIN (leave blank to keep current)' : 'PIN (4–8 digits)') + '</label><input id="f-w-pin" class="in" type="password" inputmode="numeric" autocomplete="new-password" placeholder="••••">' +
     '<label class="f">' + tr('tablesLabel') + '</label>' +
     '<input id="f-w-tables" class="in" value="' + esc(tstr) + '" oninput="tablesPrev()" placeholder="' + tr('tablesPlaceholder') + '" title="Use 1-8 for a range, or 17-18-19-20 or 17, 18, 19, 20 for selected tables.">' +
@@ -597,11 +1149,9 @@ async function saveWaiter(id) {
   var pin = val('f-w-pin');
   if (!id && !/^\d{4,8}$/.test(pin)) { waiterSaveError('Set a 4–8 digit PIN for this new staff member.', 'f-w-pin'); return; }
   if (pin && !/^\d{4,8}$/.test(pin)) { waiterSaveError('PIN must be 4–8 digits.', 'f-w-pin'); return; }
-  var role = val('f-w-role');
   var body = { name: name, tables: parseTablesText(val('f-w-tables')), active: chk('f-w-active') ? 1 : 0,
-    role: role, kitchen_station: role === 'kitchen' ? val('f-w-station') : '' };
+    role: 'waiter', kitchen_station: '' };
   if (pin) body.pin = pin;
-  if (role === 'kitchen' && !body.kitchen_station) { waiterSaveError('Enter a kitchen specialty.', 'f-w-station'); return; }
   try {
     if (id) await api('/api/staff/' + id, 'PUT', body);
     else await api('/api/staff', 'POST', body);
@@ -790,7 +1340,7 @@ function adminOrders() {
       '<span>' + tr('ticket') + ' <b>#' + o.id + '</b> ' + hhmm(o.created_at) + '</span>' +
       '<span class="tag">' + tr('table') + ' ' + o.table_no + '</span>' +
       '<span class="grow">' + esc(o.staff_name || '') + ' · ' + n + ' ' + (n === 1 ? tr('itemSingular') : tr('itemsPlural')) +
-        (o.cancel_reason ? ' · <span style="color:#fca5a5">' + esc(o.cancel_reason) + '</span>' : '') + '</span>' +
+        (o.cancel_reason ? ' · <span style="color:#dc2626">' + esc(o.cancel_reason) + '</span>' : '') + '</span>' +
       '<span class="bigprice">' + money(o.total) + '</span>' +
       '<span class="tag">' + tr('paid') + ': ' + money(o.paid || 0) + ' · ' + tr('balance') + ': ' + money(o.balance || 0) + '</span>' +
       '</div>' + payments + '<div class="row">' +

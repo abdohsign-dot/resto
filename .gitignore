@@ -6,3 +6,4 @@ data/item_images/
 data/restaurant.db
 config.json
 .venv/
+.aider*
