@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -488,6 +489,85 @@ class RestaurantFeatureTests(unittest.TestCase):
         self.assertTrue(archived and os.path.isfile(archived))
         reprint = server.ticket_text(server.get_order(self.conn, order["order_id"]), "en")
         self.assertIn("32.00 MAD", reprint)
+
+    def test_imported_order_splits_by_station_without_waiter(self):
+        section_rows = self.conn.execute("SELECT id,name FROM sections WHERE branch_id=1 LIMIT 1").fetchone()
+        first_section = section_rows["id"]
+        second_section = self.conn.execute(
+            "INSERT INTO sections(name,position,active,branch_id,kitchen_station,image_path) "
+            "VALUES('Drinks',99,1,1,'Drinks','') RETURNING id").fetchone()[0]
+        server.h_section_update([str(first_section)], {
+            "branch_id": 1, "kitchen_station": "Fish",
+        }, self.conn)
+        products = []
+        for section_id, name in ((first_section, "Salmon"), (second_section, "Tea")):
+            product = server.h_catalog_product_create([], {
+                "branch_id": 1, "section_id": section_id, "name": name,
+                "variants": [{"name": "Regular", "price_cents": 1000,
+                              "stock_qty": 10, "is_default": 1, "active": 1}],
+            }, self.conn)
+            variant_id = self.conn.execute(
+                "SELECT id FROM product_variants WHERE product_id=?",
+                (product["product_id"],)).fetchone()["id"]
+            products.append((product["product_id"], variant_id))
+        created = server.h_catalog_order_create({
+            "branch_id": 1, "order_type": "imported", "table_no": 0,
+            "staff_id": 9999, "lines": [
+                {"product_id": pid, "variant_id": vid, "qty": 1}
+                for pid, vid in products
+            ],
+        }, self.conn, 1)
+        order = server.get_order(self.conn, created["order_id"])
+        self.assertEqual(order["order_type"], "imported")
+        self.assertEqual(order["table_no"], 0)
+        self.assertEqual(order["staff_name"], "Imported")
+        self.assertIsNone(order["staff_id"])
+        split = server.split_order_by_station(order)
+        self.assertEqual([station for station, _ in split], ["Drinks", "Fish"])
+        fish_ticket = server.station_ticket_text(order, "Fish", dict(split)["Fish"], "en")
+        self.assertIn("IMPORTED ORDER", fish_ticket)
+        self.assertIn("Salmon", fish_ticket)
+        self.assertNotIn("Tea", fish_ticket)
+        self.assertNotIn("10.00", fish_ticket)
+
+    def test_station_and_admin_printer_routing(self):
+        section = self.conn.execute("SELECT id FROM sections WHERE branch_id=1 LIMIT 1").fetchone()["id"]
+        server.h_section_update([str(section)], {"branch_id": 1, "kitchen_station": "Fish"}, self.conn)
+        product = server.h_catalog_product_create([], {
+            "branch_id": 1, "section_id": section, "name": "Fish dish",
+            "variants": [{"name": "Regular", "price_cents": 1200,
+                          "stock_qty": 5, "is_default": 1, "active": 1}],
+        }, self.conn)
+        variant = self.conn.execute("SELECT id FROM product_variants WHERE product_id=?",
+                                    (product["product_id"],)).fetchone()["id"]
+        created = server.h_catalog_order_create({
+            "branch_id": 1, "table_no": 3,
+            "lines": [{"product_id": product["product_id"], "variant_id": variant, "qty": 1}],
+        }, self.conn, 1)
+        server.CONFIG["printers"] = {
+            "default": {"ip": "10.0.0.1", "port": 9100},
+            "admin": {"ip": "10.0.0.9", "port": 9100},
+            "stations": {"Fish": {"ip": "10.0.0.2", "port": 9100}},
+        }
+        self.assertEqual(server.printer_config("Fish")["ip"], "10.0.0.2")
+        self.assertEqual(server.printer_config("Drinks")["ip"], "10.0.0.1")
+        self.assertEqual(server.printer_config("admin")["ip"], "10.0.0.9")
+        with self.assertRaisesRegex(server.ApiError, "admin receipt printer is required"):
+            server.h_settings([], {"printers": {
+                "default": {"ip": "10.0.0.1", "port": 9100},
+                "admin": {"ip": "", "port": 9100}, "stations": {},
+            }}, self.conn)
+        with mock.patch.object(server, "send_escpos", return_value=(True, "")) as send:
+            kitchen_result = server.print_ticket(created["order_id"])
+        self.assertTrue(kitchen_result["printed"])
+        self.assertEqual([call.args[1]["ip"] for call in send.call_args_list], ["10.0.0.2"])
+        send.reset_mock()
+        with mock.patch.object(server, "send_escpos", return_value=(True, "")) as send_receipt:
+            receipt_result = server.print_admin_receipt(created["order_id"])
+        self.assertTrue(receipt_result["printed"])
+        self.assertEqual(len(send_receipt.call_args_list), 1)
+        self.assertEqual(send_receipt.call_args.args[1]["ip"], "10.0.0.9")
+        self.assertIn("12.00 MAD", receipt_result["ticket"])
 
     def test_catalog_historical_price_and_variant_cancel_stock(self):
         section = self.conn.execute("SELECT id FROM sections LIMIT 1").fetchone()

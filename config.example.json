@@ -1,5 +1,7 @@
 {
   "restaurant_name": "Restaurant",
+  "restaurant_logo": "",
+  "restaurant_logo_compact": "",
   "currency": "MAD",
   "admin_pin": "1234",
   "printer_ip": "",

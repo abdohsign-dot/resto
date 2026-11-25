@@ -26,6 +26,7 @@ import re
 import signal
 import socket
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -44,10 +45,13 @@ APP_PATH = os.path.join(BASE, "app.html")
 
 DEFAULT_CONFIG = {
     "restaurant_name": "Restaurant",
+    "restaurant_logo": "",
+    "restaurant_logo_compact": "",
     "currency": "MAD",
     "admin_pin": "1234",
     "printer_ip": "",
     "printer_port": 9100,
+    "printers": {"default": {"ip": "", "port": 9100}, "admin": {"ip": "", "port": 9100}, "stations": {}},
     "autoprint": True,         # print ticket automatically when an order arrives
     "port": 8080,
     "disk_warning_mb": 500,
@@ -56,7 +60,7 @@ DEFAULT_CONFIG = {
     "ticket_red_minutes": 10,
 }
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # ---------------------------------------------------------------- config / db
 
@@ -332,7 +336,8 @@ def init_db():
         },
         "orders": {"branch_id": "INTEGER NOT NULL DEFAULT 1",
                    "bill_requested": "INTEGER NOT NULL DEFAULT 0",
-                   "lang": "TEXT NOT NULL DEFAULT 'fr'"},
+                   "lang": "TEXT NOT NULL DEFAULT 'fr'",
+                   "order_type": "TEXT NOT NULL DEFAULT 'dine_in'"},
         "order_items": {"modifiers": "TEXT NOT NULL DEFAULT '[]'",
                         "stock_debited": "INTEGER NOT NULL DEFAULT 0",
                         "variant_id": "INTEGER",
@@ -570,7 +575,12 @@ def get_order(conn, order_id, with_lines=True):
     o = dict(o)
     if with_lines:
         o["lines"] = [dict(r) for r in conn.execute(
-            "SELECT * FROM order_items WHERE order_id=? ORDER BY id", (order_id,))]
+            "SELECT oi.*, COALESCE(NULLIF(TRIM(s.kitchen_station),''), s.name, 'General Kitchen') kitchen_station "
+            "FROM order_items oi LEFT JOIN items i ON i.id=oi.item_id "
+            "LEFT JOIN product_variants v ON v.id=oi.variant_id "
+            "LEFT JOIN products p ON p.id=v.product_id "
+            "LEFT JOIN sections s ON s.id=COALESCE(i.section_id,p.section_id) "
+            "WHERE oi.order_id=? ORDER BY oi.id", (order_id,))]
         o["total"] = order_total(o["lines"])
     return o
 
@@ -681,13 +691,16 @@ def ticket_text(order, lang="fr"):
     }
     labels = labels.get(lang, labels["en"])
     sep = "-" * TICKET_W
-    created = time.strftime("%d/%m/%Y %H:%M", time.localtime(order["created_at"]))
+    created = time.strftime("%d/%m/%Y %H:%M:%S", time.localtime(order["created_at"]))
     out = []
-    out.append(cfg["restaurant_name"][:TICKET_W].center(TICKET_W).rstrip())
+    out.append((cfg.get("restaurant_name") or "")[:TICKET_W].center(TICKET_W).rstrip())
     out.append(sep)
     out.append("%s #%d" % (labels["ticket"], order["id"]))
-    out.append("%s: %s" % (labels["table"], order["table_no"]))
-    out.append("%s: %s" % (labels["waiter"], order["staff_name"] or "-"))
+    if order.get("order_type") == "imported" or order.get("table_no") == 0:
+        out.append("*** IMPORTED ORDER ***")
+    else:
+        out.append("%s: %s" % (labels["table"], order["table_no"]))
+        out.append("%s: %s" % (labels["waiter"], order["staff_name"] or "-"))
     out.append(created)
     if order.get("note"):
         out.append("** %s **" % order["note"])
@@ -741,6 +754,7 @@ def ticket_text(order, lang="fr"):
 def escpos_bytes(text):
     b = b"\x1b@"                      # init
     b += b"\x1ba\x01"                 # center
+    b += escpos_logo_bytes()
     header, rest = text.split("\n", 1)
     b += header.encode("cp437", errors="replace") + b"\n"
     b += b"\x1ba\x00"                 # left
@@ -748,12 +762,76 @@ def escpos_bytes(text):
     b += b"\x1dV\x01"                 # full cut
     return b
 
-def send_escpos(text):
+def escpos_logo_bytes():
+    """Convert the configured logo to ESC/POS raster data when ImageMagick exists."""
+    logo_url = str(CONFIG.get("restaurant_logo_compact") or CONFIG.get("restaurant_logo") or "")
+    match = re.fullmatch(r"/item-images/([a-fA-F0-9]{32})\.(png|jpg|webp)", logo_url)
+    if not match:
+        return b""
+    path = os.path.join(IMAGES_DIR, match.group(1) + "." + match.group(2))
+    if not os.path.isfile(path):
+        return b""
+    try:
+        converted = subprocess.run(
+            ["convert", path, "-auto-orient", "-thumbnail", "384x240", "-background", "white",
+             "-alpha", "remove", "-colorspace", "gray", "-depth", "8", "pgm:-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4, check=True)
+        raw = converted.stdout
+        header = re.match(rb"P5\s+(?:#[^\r\n]*(?:\r?\n|\s+))*?(\d+)\s+(\d+)\s+255\s", raw)
+        if not header:
+            return b""
+        width, height = int(header.group(1)), int(header.group(2))
+        pixels = raw[header.end():header.end() + width * height]
+        if len(pixels) != width * height:
+            return b""
+        row_bytes = (width + 7) // 8
+        bitmap = bytearray(row_bytes * height)
+        for y in range(height):
+            for x in range(width):
+                if pixels[y * width + x] < 160:
+                    bitmap[y * row_bytes + x // 8] |= 0x80 >> (x % 8)
+        return b"\x1d\x76\x30\x00" + bytes((row_bytes & 255, row_bytes >> 8,
+                                                     height & 255, height >> 8)) + bytes(bitmap) + b"\n"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return b""
+
+def printer_config(destination=None):
+    """Resolve a dedicated station/admin printer, falling back to the legacy default."""
+    printers = CONFIG.get("printers") if isinstance(CONFIG.get("printers"), dict) else {}
+    if destination == "admin":
+        candidate = printers.get("admin") or {}
+        return candidate if candidate.get("ip") else None
+    if destination:
+        stations = printers.get("stations") if isinstance(printers.get("stations"), dict) else {}
+        candidate = stations.get(destination) or {}
+        if candidate.get("ip"):
+            return candidate
+    candidate = printers.get("default") or {}
+    if candidate.get("ip"):
+        return candidate
+    if CONFIG.get("printer_ip"):
+        return {"ip": CONFIG.get("printer_ip"), "port": CONFIG.get("printer_port") or 9100}
+    return None
+
+def any_printer_configured():
+    printers = CONFIG.get("printers") if isinstance(CONFIG.get("printers"), dict) else {}
+    return bool(printer_config() or printer_config("admin") or any(
+        isinstance(value, dict) and value.get("ip")
+        for value in (printers.get("stations") or {}).values()))
+
+def any_kitchen_printer_configured():
+    printers = CONFIG.get("printers") if isinstance(CONFIG.get("printers"), dict) else {}
+    stations = printers.get("stations") if isinstance(printers.get("stations"), dict) else {}
+    return bool(printer_config() or any(
+        isinstance(value, dict) and value.get("ip") for value in stations.values()))
+
+def send_escpos(text, printer=None):
     """Send raw ESC/POS to a network thermal printer. Returns (ok, error)."""
-    ip = (CONFIG.get("printer_ip") or "").strip()
+    printer = printer or printer_config()
+    ip = ((printer or {}).get("ip") or "").strip()
     if not ip:
         return False, "No printer configured"
-    port = int(CONFIG.get("printer_port") or 9100)
+    port = int((printer or {}).get("port") or 9100)
     try:
         s = socket.create_connection((ip, port), timeout=4)
         try:
@@ -776,18 +854,105 @@ def save_ticket(order, text):
         return ""
 
 def print_ticket(order_id):
+    """Dispatch kitchen station slips only; never print the admin receipt here."""
     conn = db()
     try:
         order = get_order(conn, order_id)
     finally:
         conn.close()
-    text = ticket_text(order, order.get("lang", "fr"))
-    save_ticket(order, text)
-    ok, err = send_escpos(text)
+    slips = split_order_by_station(order)
+    texts = [station_ticket_text(order, station, lines, order.get("lang", "fr"))
+             for station, lines in slips]
+    for index, text in enumerate(texts, 1):
+        save_station_ticket(order, slips[index - 1][0], text)
+    text = "\n\n".join(texts)
+    results = []
+    for (station, _lines), station_text in zip(slips, texts):
+        results.append(send_escpos(station_text, printer_config(station)))
+    ok = bool(results) and all(result[0] for result in results)
+    err = "; ".join(result[1] for result in results if not result[0])
     return {"ok": True, "printed": ok, "error": err, "ticket": text}
 
+def print_admin_receipt(order_id, payment_info=None):
+    """Print a full priced receipt to the admin printer."""
+    conn = db()
+    try:
+        order = get_order(conn, order_id)
+    finally:
+        conn.close()
+    receipt = ticket_text(order, order.get("lang", "fr"))
+    if payment_info:
+        receipt += "\n" + ("-" * TICKET_W)
+        receipt += "\nPAYMENT RECEIVED: %0.2f %s" % (
+            payment_info["amount"], CONFIG.get("currency") or "MAD")
+        receipt += "\nMETHOD: %s" % str(payment_info["method"]).upper()
+        receipt += "\nBALANCE: %0.2f %s" % (
+            payment_info["balance"], CONFIG.get("currency") or "MAD")
+    save_ticket(order, receipt)
+    ok, err = send_escpos(receipt, printer_config("admin"))
+    return {"ok": True, "printed": ok, "error": err, "ticket": receipt}
+
+def maybe_print_admin_receipt(order_id, payment_info):
+    """Print payment receipts without routing them to kitchen printers."""
+    if not printer_config("admin"):
+        return {"printed": False, "error": "Admin receipt printer is not configured"}
+    try:
+        return print_admin_receipt(order_id, payment_info)
+    except Exception as exc:
+        return {"printed": False, "error": str(exc)}
+
+def split_order_by_station(order):
+    groups = {}
+    for line in order.get("lines", []):
+        if line.get("status") == "cancelled":
+            continue
+        station = (line.get("kitchen_station") or "").strip() or "General Kitchen"
+        groups.setdefault(station, []).append(line)
+    return sorted(groups.items(), key=lambda pair: pair[0].casefold())
+
+def station_ticket_text(order, station_name, station_lines, lang="en"):
+    sep = "=" * TICKET_W
+    out = [(CONFIG.get("restaurant_name") or "")[:TICKET_W].center(TICKET_W).rstrip(),
+           ("[ STATION: %s ]" % station_name.upper())[:TICKET_W],
+           "Ticket #%s  -  %s" % (order["id"], time.strftime("%d/%m/%Y %H:%M:%S", time.localtime(order["created_at"]))) ]
+    if order.get("order_type") == "imported" or order.get("table_no") == 0:
+        out.append("*** IMPORTED ORDER ***")
+    else:
+        out.append("Table: %s   Waiter: %s" % (order.get("table_no", ""), order.get("staff_name") or "-"))
+    if order.get("note"):
+        out.append("Note: " + str(order["note"])[:TICKET_W - 6])
+    out.append("-" * TICKET_W)
+    count = 0
+    for line in station_lines:
+        count += int(line.get("qty") or 0)
+        name = str(line.get("name") or "")
+        if line.get("variant_name"):
+            name += " (%s)" % line["variant_name"]
+        out.append("%sx %s" % (line.get("qty", 1), name[:TICKET_W - 5]))
+        try:
+            modifiers = json.loads(line.get("modifiers") or line.get("modifiers_json") or "[]")
+        except (TypeError, ValueError):
+            modifiers = []
+        for mod in modifiers:
+            out.append("   + " + str(mod.get("name") or "")[:TICKET_W - 6])
+        if line.get("note"):
+            out.append("   . " + str(line["note"])[:TICKET_W - 6])
+    out.extend(["-" * TICKET_W, "Items for this station: %d" % count, sep])
+    return "\n".join(out)
+
+def save_station_ticket(order, station, text):
+    try:
+        os.makedirs(TICKETS_DIR, exist_ok=True)
+        safe_station = re.sub(r"[^a-zA-Z0-9_-]+", "_", station)[:40] or "station"
+        path = os.path.join(TICKETS_DIR, "ticket_%d_%s_%s.txt" % (
+            order["id"], safe_station, time.strftime("%Y%m%d_%H%M%S")))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+
 def maybe_autoprint(order_id):
-    if CONFIG.get("autoprint") and (CONFIG.get("printer_ip") or "").strip():
+    if any_kitchen_printer_configured():
         threading.Thread(target=lambda: (lambda r: print("autoprint #%d: %s" %
             (order_id, "ok" if r["printed"] else r["error"])))(print_ticket(order_id)),
             daemon=True).start()
@@ -796,6 +961,7 @@ TICKET_HTML = """<!doctype html><html lang="%(lang)s" dir="%(dir)s"><head><meta 
 <title>%(ticket)s #%(id)d</title><style>
 @page { size: 80mm auto; margin: 3mm; }
 body { font: 12px/1.35 "Courier New", monospace; white-space: pre; margin: 0; direction: %(dir)s; text-align: %(align)s; }
+.logo { display: block; max-width: 50mm; max-height: 25mm; object-fit: contain; margin: 0 auto 3mm; }
 @media print { .noprint { display: none } }
 .noprint { padding: 8px; text-align: center; }
 .noprint button { font-size: 16px; padding: 10px 22px; }
@@ -816,8 +982,11 @@ def ticket_html(order_id, lang="en"):
     labels = {"fr": ("Imprimer le ticket", "right"), "ar": ("طباعة التذكرة", "right"),
               "en": ("Print ticket", "left")}
     print_label, align = labels[lang]
+    logo_url = str(CONFIG.get("restaurant_logo_compact") or CONFIG.get("restaurant_logo") or "")
+    logo = '<img class="logo" src="%s" alt="">' % logo_url if re.fullmatch(
+        r"/item-images/[a-fA-F0-9]{32}\.(?:png|jpg|webp)", logo_url) else ""
     return TICKET_HTML % {
-        "id": order_id, "body": "<div>%s</div>" % text, "lang": lang,
+        "id": order_id, "body": logo + "<div>%s</div>" % text, "lang": lang,
         "dir": "rtl" if lang == "ar" else "ltr", "align": align,
         "ticket": {"fr": "Ticket", "ar": "تذكرة", "en": "Ticket"}[lang],
         "print_label": print_label,
@@ -901,11 +1070,11 @@ def h_state(args, body, conn):
         "rev": get_rev(conn),
         "catalog_rev": get_catalog_rev(conn),
         "now": time.time(),
-        "restaurant": CONFIG["restaurant_name"],
+        "restaurant": CONFIG.get("restaurant_name", ""),
         "currency": CONFIG["currency"],
-        "has_printer": bool((CONFIG.get("printer_ip") or "").strip()),
+        "has_printer": any_printer_configured(),
         "settings": {k: CONFIG.get(k) for k in
-                     ("restaurant_name", "currency", "printer_ip", "printer_port", "autoprint",
+                     ("restaurant_name", "restaurant_logo", "restaurant_logo_compact", "currency", "printer_ip", "printer_port", "printers", "autoprint",
                       "disk_warning_mb", "log_retention_days",
                       "ticket_amber_minutes", "ticket_red_minutes")},
         "branches": [dict(r) for r in conn.execute(
@@ -921,6 +1090,10 @@ def h_state(args, body, conn):
         "payments": [dict(payment) for order in orders for payment in conn.execute(
             "SELECT * FROM payments WHERE order_id=? ORDER BY created_at", (order["id"],))],
         "orders": orders,
+        "table_numbers": [r["table_no"] for r in conn.execute(
+            "SELECT DISTINCT table_no FROM orders WHERE branch_id=? AND table_no>0 "
+            "UNION SELECT DISTINCT table_no FROM reservations WHERE branch_id=? AND table_no>0 "
+            "ORDER BY table_no", (branch_id, branch_id))],
     }
 
 def h_staff_auth(args, body, conn):
@@ -947,9 +1120,16 @@ def h_staff_auth(args, body, conn):
     }
 
 def h_catalog_order_create(body, conn, branch_id):
-    table_no = body.get("table_no")
-    if isinstance(table_no, bool) or not isinstance(table_no, int) or table_no <= 0:
-        raise ApiError(400, "table_no must be a positive integer")
+    order_type = body.get("order_type", "dine_in")
+    if order_type not in ("dine_in", "imported"):
+        raise ApiError(400, "Invalid order_type")
+    table_no = body.get("table_no", 0)
+    # For imported orders, allow table_no = 0; for dine_in, require positive integer
+    if order_type == "dine_in":
+        if isinstance(table_no, bool) or not isinstance(table_no, int) or table_no <= 0:
+            raise ApiError(400, "table_no must be a positive integer for dine-in orders")
+    else:  # imported
+        table_no = 0  # always store 0 for imported orders
     lines = body.get("lines") or []
     if not isinstance(lines, list) or not lines:
         raise ApiError(400, "Order has no items")
@@ -962,7 +1142,10 @@ def h_catalog_order_create(body, conn, branch_id):
             return {"ok": True, "order_id": existing["id"], "duplicate": True}
     staff_id = body.get("staff_id")
     staff_name = ""
-    if staff_id:
+    if order_type == "imported":
+        staff_id = None
+        staff_name = "Imported"
+    elif staff_id:
         staff = conn.execute("SELECT name FROM staff WHERE id=? AND branch_id=?",
                              (staff_id, branch_id)).fetchone()
         if not staff:
@@ -971,10 +1154,10 @@ def h_catalog_order_create(body, conn, branch_id):
     now = time.time()
     order = conn.execute(
         "INSERT INTO orders(uuid,table_no,staff_id,staff_name,note,status,created_at,"
-        "updated_at,branch_id,lang) VALUES(?,?,?,?,?, 'sent',?,?,?,?)",
+        "updated_at,branch_id,lang,order_type) VALUES(?,?,?,?,?, 'sent',?,?,?,?,?)",
         (uuid or None, table_no, staff_id, staff_name,
          str(body.get("note") or "")[:300], now, now, branch_id,
-         body.get("lang") if body.get("lang") in ("fr", "ar", "en") else "fr"))
+         body.get("lang") if body.get("lang") in ("fr", "ar", "en") else "fr", order_type))
     order_id = order.lastrowid
     try:
         for line in lines:
@@ -1093,9 +1276,9 @@ def h_catalog_order_create(body, conn, branch_id):
 def h_order_create(args, body, conn):
     branch_id = get_branch_id(body)
     require_branch(conn, branch_id)
-    table_no = body.get("table_no")
-    if isinstance(table_no, bool) or not isinstance(table_no, int) or table_no <= 0:
-        raise ApiError(400, "table_no must be a positive integer")
+    order_type = body.get("order_type", "dine_in")
+    if order_type not in ("dine_in", "imported"):
+        raise ApiError(400, "Invalid order_type")
     lines = body.get("lines") or []
     if not lines:
         raise ApiError(400, "Order has no items")
@@ -1111,20 +1294,30 @@ def h_order_create(args, body, conn):
             if existing["branch_id"] != branch_id:
                 raise ApiError(409, "Client order ID is already used by another branch")
             return {"ok": True, "order_id": existing["id"], "duplicate": True}
+    table_no = body.get("table_no", 0)
+    # For imported orders, allow table_no = 0; for dine_in, require positive integer
+    if order_type == "dine_in":
+        if isinstance(table_no, bool) or not isinstance(table_no, int) or table_no <= 0:
+            raise ApiError(400, "table_no must be a positive integer for dine-in orders")
+    else:  # imported
+        table_no = 0  # always store 0 for imported orders
     staff_id = body.get("staff_id")
     staff_name = ""
-    if staff_id:
-        s = conn.execute("SELECT name FROM staff WHERE id=? AND branch_id=?",
-                         (staff_id, branch_id)).fetchone()
-        if not s:
+    if order_type == "imported":
+        staff_id = None
+        staff_name = "Imported"
+    elif staff_id:
+        staff = conn.execute("SELECT name FROM staff WHERE id=? AND branch_id=?",
+                             (staff_id, branch_id)).fetchone()
+        if not staff:
             raise ApiError(400, "Waiter does not belong to this branch")
-        staff_name = s["name"]
+        staff_name = staff["name"]
     now = time.time()
     cur = conn.execute(
-        "INSERT INTO orders(uuid, table_no, staff_id, staff_name, note, status, created_at, updated_at, branch_id, lang) "
-        "VALUES(?,?,?,?,?,'sent',?,?,?,?)",
+        "INSERT INTO orders(uuid, table_no, staff_id, staff_name, note, status, created_at, updated_at, branch_id, lang, order_type) "
+        "VALUES(?,?,?,?,?,'sent',?,?,?,?,?)",
         (uuid or None, table_no, staff_id, staff_name, str(body.get("note") or "")[:300], now, now,
-         branch_id, body.get("lang") if body.get("lang") in ("fr", "ar", "en") else "fr"))
+         branch_id, body.get("lang") if body.get("lang") in ("fr", "ar", "en") else "fr", order_type))
     order_id = cur.lastrowid
     for l in lines:
         try:
@@ -2617,7 +2810,11 @@ def h_payment_create(args, body, conn):
         if abs(round(allocated_total, 2) - amount) > 0.01:
             raise ApiError(400, "Payment amount must match the selected items")
     bump_rev(conn); conn.commit()
-    return {"ok": True, "payment_id": payment_id, "balance": round(order["total"] - paid - amount, 2)}
+    balance = round(order["total"] - paid - amount, 2)
+    receipt = maybe_print_admin_receipt(
+        order_id, {"amount": amount, "method": method, "balance": balance})
+    return {"ok": True, "payment_id": payment_id, "balance": balance,
+            "receipt_printed": receipt["printed"], "receipt_error": receipt["error"]}
 
 def h_bill_request(args, body, conn):
     branch_id = get_branch_id(body)
@@ -2656,22 +2853,99 @@ def h_sales(args, body, conn):
     branch_id = get_branch_id(body)
     require_branch(conn, branch_id)
     period = body.get("period", "7d")
-    days = {"7d": 7, "30d": 30, "90d": 90}.get(period)
-    if not days:
-        raise ApiError(400, "Period must be 7d, 30d, or 90d")
-    start = time.time() - days * 86400
+    date_from, date_to = body.get("date_from") or "", body.get("date_to") or ""
+    time_from, time_to = body.get("time_from") or "00:00", body.get("time_to") or "23:59"
+    actor = body.get("actor") or "all"
+    if not isinstance(actor, str):
+        raise ApiError(400, "Invalid actor filter")
+    where = ["o.branch_id=?"]
+    params = [branch_id]
+    if date_from or date_to:
+        try:
+            start_day = datetime.date.fromisoformat(date_from)
+            end_day = datetime.date.fromisoformat(date_to)
+        except (TypeError, ValueError):
+            raise ApiError(400, "Both valid report dates are required")
+        if end_day < start_day:
+            raise ApiError(400, "End date must be on or after start date")
+        if (end_day - start_day).days > 3660:
+            raise ApiError(400, "Date range cannot exceed 10 years")
+        where.extend(["date(p.created_at,'unixepoch','localtime')>=?",
+                      "date(p.created_at,'unixepoch','localtime')<=?"])
+        params.extend([date_from, date_to])
+        period = "custom"
+    else:
+        days = {"7d": 7, "30d": 30, "90d": 90}.get(period)
+        if not days:
+            raise ApiError(400, "Period must be 7d, 30d, 90d, or custom with dates")
+        start = time.time() - days * 86400
+        where.append("p.created_at>=?")
+        params.append(start)
+        date_to = time.strftime("%Y-%m-%d", time.localtime())
+        date_from = time.strftime("%Y-%m-%d", time.localtime(start))
+    try:
+        datetime.datetime.strptime(time_from, "%H:%M")
+        datetime.datetime.strptime(time_to, "%H:%M")
+    except (TypeError, ValueError):
+        raise ApiError(400, "Times must use HH:MM format")
+    local_time = "strftime('%H:%M',p.created_at,'unixepoch','localtime')"
+    if time_from <= time_to:
+        where.append(local_time + " BETWEEN ? AND ?")
+        params.extend([time_from, time_to])
+    else:  # allow overnight windows such as 22:00–02:00
+        where.append("(" + local_time + ">=? OR " + local_time + "<=?)")
+        params.extend([time_from, time_to])
+    if actor == "admin":
+        where.append("o.staff_id IS NULL")
+    elif actor == "waiter":
+        where.append("o.staff_id IS NOT NULL")
+    elif actor.startswith("waiter:"):
+        try:
+            waiter_id = int(actor.split(":", 1)[1])
+        except (TypeError, ValueError):
+            raise ApiError(400, "Invalid waiter filter")
+        if not conn.execute("SELECT 1 FROM staff WHERE id=? AND branch_id=?", (waiter_id, branch_id)).fetchone():
+            raise ApiError(400, "Waiter not found for this branch")
+        where.append("o.staff_id=?")
+        params.append(waiter_id)
+    elif actor != "all":
+        raise ApiError(400, "Actor must be all, admin, waiter, or waiter:<id>")
+    where.append("p.amount>p.refunded_amount")
+
+    predicate = " AND ".join(where)
+    payment_source = "FROM payments p JOIN orders o ON o.id=p.order_id "
     daily = [dict(row) for row in conn.execute(
         "SELECT date(p.created_at,'unixepoch','localtime') day, "
-        "ROUND(SUM(p.amount-p.refunded_amount),2) revenue, COUNT(*) payments "
-        "FROM payments p JOIN orders o ON o.id=p.order_id "
-        "WHERE o.branch_id=? AND p.created_at>=? GROUP BY day HAVING revenue>0 ORDER BY day",
-        (branch_id, start))]
+        "ROUND(SUM(p.amount-p.refunded_amount),2) revenue, COUNT(*) payments " + payment_source +
+        "WHERE " + predicate + " GROUP BY day HAVING revenue>0 ORDER BY day", params)]
+    transactions = [dict(row) for row in conn.execute(
+        "SELECT p.id payment_id,o.id order_id,p.created_at,"
+        "ROUND(p.amount-p.refunded_amount,2) amount,p.method,o.staff_id,"
+        "CASE WHEN o.staff_id IS NULL THEN 'Admin' ELSE COALESCE(s.name,o.staff_name,'Waiter') END actor_name,"
+        "o.order_type,o.table_no " + payment_source +
+        "LEFT JOIN staff s ON s.id=o.staff_id "
+        "WHERE " + predicate + " AND p.amount>p.refunded_amount ORDER BY p.created_at,o.id", params)]
     top_items = [dict(row) for row in conn.execute(
         "SELECT oi.name, SUM(oi.qty) quantity, ROUND(SUM(oi.price*oi.qty),2) value "
         "FROM order_items oi JOIN orders o ON o.id=oi.order_id "
-        "WHERE o.branch_id=? AND o.created_at>=? AND oi.status!='cancelled' "
-        "GROUP BY oi.name ORDER BY quantity DESC LIMIT 10", (branch_id, start))]
-    return {"ok": True, "period": period, "daily": daily, "top_items": top_items}
+        "WHERE oi.status!='cancelled' AND o.id IN (SELECT o.id " + payment_source + "WHERE " + predicate + ") "
+        "GROUP BY oi.name ORDER BY quantity DESC LIMIT 10", params)]
+    total_revenue = round(sum(row["amount"] for row in transactions), 2)
+    by_actor_map = {}
+    for row in transactions:
+        key = row["staff_id"]
+        bucket = by_actor_map.setdefault(key, {"staff_id": key, "name": row["actor_name"],
+                                                "revenue": 0.0, "payments": 0})
+        bucket["revenue"] += row["amount"]
+        bucket["payments"] += 1
+    by_actor = sorted([dict(name=row["name"], staff_id=row["staff_id"],
+                            revenue=round(row["revenue"], 2), payments=row["payments"])
+                       for row in by_actor_map.values()], key=lambda row: row["revenue"], reverse=True)
+    return {"ok": True, "period": period, "date_from": date_from, "date_to": date_to,
+            "time_from": time_from, "time_to": time_to, "actor": actor,
+            "total_revenue": total_revenue, "payment_count": len(transactions),
+            "daily": daily, "top_items": top_items, "by_actor": by_actor,
+            "transactions": transactions}
 
 def cents_value(row):
     cents = row["unit_price_cents"] if "unit_price_cents" in row.keys() and row["unit_price_cents"] is not None else None
@@ -2999,7 +3273,11 @@ def h_variant_image(args, body, conn):
 
 def h_settings(args, body, conn):
     global CONFIG
-    allowed = ("restaurant_name", "currency", "printer_ip", "printer_port", "autoprint", "admin_pin", "port",
+    if "restaurant_logo_upload" in body:
+        CONFIG["restaurant_logo"] = save_uploaded_catalog_image(body["restaurant_logo_upload"])
+    if "restaurant_logo_compact_upload" in body:
+        CONFIG["restaurant_logo_compact"] = save_uploaded_catalog_image(body["restaurant_logo_compact_upload"])
+    allowed = ("restaurant_name", "restaurant_logo", "restaurant_logo_compact", "currency", "printer_ip", "printer_port", "printers", "autoprint", "admin_pin", "port",
                "disk_warning_mb", "log_retention_days", "ticket_amber_minutes", "ticket_red_minutes")
     for k in allowed:
         if k in body:
@@ -3008,6 +3286,32 @@ def h_settings(args, body, conn):
                 v = int(v)
             if k == "autoprint":
                 v = bool(v)
+            if k == "printers":
+                if not isinstance(v, dict):
+                    raise ApiError(400, "printers must be an object")
+                def clean_printer(raw):
+                    if not isinstance(raw, dict):
+                        raise ApiError(400, "Invalid printer configuration")
+                    ip = str(raw.get("ip") or "").strip()[:200]
+                    try:
+                        port = int(raw.get("port") or 9100)
+                    except (TypeError, ValueError):
+                        raise ApiError(400, "Invalid printer port")
+                    if port < 1 or port > 65535:
+                        raise ApiError(400, "Printer port must be between 1 and 65535")
+                    return {"ip": ip, "port": port}
+                stations = v.get("stations") or {}
+                if not isinstance(stations, dict) or len(stations) > 100:
+                    raise ApiError(400, "Invalid station printer map")
+                admin_printer = clean_printer(v.get("admin", {}))
+                if not admin_printer["ip"]:
+                    raise ApiError(400, "An admin receipt printer is required")
+                v = {"default": clean_printer(v.get("default", {})),
+                     "admin": admin_printer,
+                     "stations": {str(name)[:100]: clean_printer(printer)
+                                  for name, printer in stations.items()}}
+                CONFIG["printer_ip"] = v["default"]["ip"]
+                CONFIG["printer_port"] = v["default"]["port"]
             if isinstance(v, str):
                 v = v[:200]
             CONFIG[k] = v
@@ -3018,7 +3322,30 @@ def h_print(args, body, conn):
     order = get_order(conn, int(args[0]), with_lines=False)
     if order["branch_id"] != get_branch_id(body):
         raise ApiError(404, "Order not found")
-    return print_ticket(int(args[0]))
+    return print_admin_receipt(int(args[0]))
+
+def h_order_history(args, body, conn):
+    branch_id = get_branch_id(body)
+    require_branch(conn, branch_id)
+    try:
+        table_no = int(body.get("table_no"))
+    except (TypeError, ValueError):
+        raise ApiError(400, "A valid table number is required")
+    if isinstance(body.get("table_no"), bool) or table_no <= 0:
+        raise ApiError(400, "A valid table number is required")
+    rows = conn.execute(
+        "SELECT id FROM orders WHERE branch_id=? AND table_no=? ORDER BY created_at DESC,id DESC LIMIT 1000",
+        (branch_id, table_no)).fetchall()
+    orders = []
+    for row in rows:
+        order = get_order(conn, row["id"])
+        payments = [dict(payment) for payment in conn.execute(
+            "SELECT * FROM payments WHERE order_id=? ORDER BY created_at,id", (order["id"],))]
+        order["payments"] = payments
+        order["paid"] = round(sum(p["amount"] - p["refunded_amount"] for p in payments), 2)
+        order["balance"] = round(max(0.0, order["total"] - order["paid"]), 2)
+        orders.append(order)
+    return {"ok": True, "table_no": table_no, "orders": orders}
 
 def h_export(args, body, conn):
     data = h_state(args, body, conn)
@@ -3054,7 +3381,8 @@ ROUTES = [
     ("POST",   r"^/api/orders/(\d+)/status$",       h_order_status,   False),
     ("POST",   r"^/api/orders/(\d+)/lines/(\d+)/status$", h_line_status, False),
     ("GET",    r"^/api/ticket/(\d+)\.html$",        h_ticket,         False),
-    ("POST",   r"^/api/print/(\d+)$",               h_print,          False),
+    ("POST",   r"^/api/print/(\d+)$",               h_print,          True),
+    ("GET",    r"^/api/orders/history$",             h_order_history,  True),
     ("GET",    r"^/api/export$",                    h_export,         True),
     ("POST",   r"^/api/sections$",                  h_section_create, True),
     ("PUT",    r"^/api/sections/(\d+)$",            h_section_update, True),
@@ -3336,14 +3664,21 @@ class Handler(BaseHTTPRequestHandler):
                         else {"lang": (query or {}).get("lang", ["en"])[0],
                               "period": (query or {}).get("period", ["7d"])[0],
                               "section_id": (query or {}).get("section_id", [None])[0],
-                              "q": (query or {}).get("q", [""])[0]})
+                              "q": (query or {}).get("q", [""])[0],
+                              "date_from": (query or {}).get("date_from", [""])[0],
+                              "date_to": (query or {}).get("date_to", [""])[0],
+                              "time_from": (query or {}).get("time_from", ["00:00"])[0],
+                              "time_to": (query or {}).get("time_to", ["23:59"])[0],
+                              "actor": (query or {}).get("actor", ["all"])[0],
+                              "table_no": (query or {}).get("table_no", [None])[0]})
                 body["branch_id"] = self.headers.get("X-Branch-ID") or (
                     (query or {}).get("branch_id", [body.get("branch_id", 1)])[0])
                 # Audit field names and low-risk allowlisted values only.
                 self._audit_fields = sorted(k for k in body if k != "branch_id")
                 safe_values = {"price", "qty", "status", "table_no", "party_size",
                                "active", "position", "stock_qty", "section_id",
-                               "copy_menu", "lang", "period"}
+                               "copy_menu", "lang", "period", "date_from", "date_to",
+                               "time_from", "time_to", "actor"}
                 self._audit_summary = {k: body[k] for k in self._audit_fields
                                        if k in safe_values and isinstance(body[k], (str, int, float, bool, type(None)))}
                 if needs_admin:

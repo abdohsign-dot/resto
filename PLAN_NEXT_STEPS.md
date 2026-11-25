@@ -3,11 +3,11 @@
 ## Overview & Scope
 This plan details the technical design and phased implementation for four next-generation features in the restaurant ordering system:
 1. **Admin Order Dashboard:** A waiter-style menu ordering interface directly accessible by the admin.
-2. **"Imported" Orders:** Ability to place non-table orders (phone, delivery, takeout, Glovo/UberEats) without table numbers or waiter names, tagged strictly as `Imported`.
+2. **"Imported" Orders:** Ability to place non-table orders without table numbers or waiter names, tagged strictly as `Imported`. integrated to Admin Order Dashboard.
 3. **Kitchen Display System (KDS) Integration:** Differentiating tickets on kitchen screens with clear attribution: `Table {N} · {Waiter Name}` vs. `📦 Imported Order`.
-4. **Station-Split Kitchen Ticket Printing:** Splitting tickets by section/station (e.g. Fish chef gets fish items, Bar gets drinks) with automatic thermal printer dispatch and clean paper cuts.
+4. **Station-Split Kitchen Ticket Printing:** Splitting tickets by section/station (e.g. Fish chef gets fish items, Bar gets drinks) with dedicated printer routing, plus a separate admin receipt printer.
 
-> **Note:** As requested, this document is a comprehensive design and execution plan. No production code changes have been introduced yet.
+> **Status:** Planned implementation is complete. The 24-test server feature suite passes, including the new imported-order and printer-routing coverage.
 
 ---
 
@@ -39,7 +39,8 @@ In the new architecture:
   1. Group lines by their resolved `kitchen_station`.
   2. For each station that has items, generate a dedicated **Station Ticket**.
   3. Format each station slip with the station name, order identifier (Table vs. Imported), items with modifiers/notes, and overall ticket metadata.
-  4. Send ESC/POS commands with a full paper cut (`\x1dV\x01`) between station slips.
+  4. Route each station slip to its configured printer, falling back to a default kitchen printer; each job ends with a full paper cut (`\x1dV\x01`).
+  5. Send a full priced receipt only to the required admin printer when an admin explicitly requests it; automatic kitchen orders never route there.
 
 ---
 
@@ -156,18 +157,20 @@ Items for this station: 3
 [ CUT PAPER ]
 ```
 
-#### 4.3 Printer Dispatch Options
-- **Default (Single Shared Kitchen Printer):**
-  - Iterates over all station groups with active items.
-  - Prints each station ticket in sequence, separated by the ESC/POS cut command (`\x1dV\x01`), so the chef can tear off individual slips for each section.
-- **Advanced Multi-Printer Readiness:**
-  - Architecture allows mapping station names to individual printer IPs in `config.json` if the restaurant upgrades to separate physical printers in the future:
-    ```json
-    "printers": {
-      "default": { "ip": "192.168.1.200", "port": 9100 },
-      "Drinks": { "ip": "192.168.1.201", "port": 9100 }
+#### 4.3 Printer Dispatch
+- Every configured kitchen station can route to its own printer. Stations without an address use the default kitchen printer; older `printer_ip` and `printer_port` settings remain supported as that default.
+- The required `admin` printer receives a full priced order receipt only on an explicit admin print action; automatic kitchen orders never route there. Kitchen station slips omit prices.
+- Configuration shape:
+  ```json
+  "printers": {
+    "default": { "ip": "192.168.1.200", "port": 9100 },
+    "admin": { "ip": "192.168.1.210", "port": 9100 },
+    "stations": {
+      "Fish": { "ip": "192.168.1.201", "port": 9100 },
+      "Drinks": { "ip": "192.168.1.202", "port": 9100 }
     }
-    ```
+  }
+  ```
 
 ---
 
@@ -207,42 +210,45 @@ Items for this station: 3
 ```
 
 ### Phase 1: Backend & Schema
-- [ ] Add `order_type` to `orders` table in `server.py` migration.
-- [ ] Update `h_order_create` to validate:
+- [x] Add `order_type` to `orders` table in `server.py` migration.
+- [x] Update `h_order_create` to validate:
   - If `order_type == "imported"`: accept `table_no = 0`, store `staff_name = "Imported"`.
   - If `order_type == "dine_in"`: require positive integer `table_no`.
-- [ ] Update `h_state` order serialization to include `order_type`.
+- [x] Update `h_state` order serialization to include `order_type`.
 
 ### Phase 2: Kitchen Display System (KDS)
-- [ ] Update `kCard` in `app3.js`:
+- [x] Update `kCard` in `app3.js`:
   - Check `o.order_type === 'imported'` or `o.table_no === 0`.
   - Render `📦 Imported` header without waiter name.
   - Render `Table {table_no} · {waiter_name}` for dine-in.
-- [ ] Add CSS badge `.khead-imported` in `app.css`.
+- [x] Add CSS badge `.khead-imported` in `app.css`.
 
 ### Phase 3: Station-Split Printing Engine
-- [ ] Create `split_order_by_station(order)` helper in `server.py`.
-- [ ] Implement `station_ticket_text(order, station_name, station_lines, lang)`:
+- [x] Create `split_order_by_station(order)` helper in `server.py`.
+- [x] Implement `station_ticket_text(order, station_name, station_lines, lang)`:
   - Header explicitly announces the station name in bold/caps.
   - Shows Table/Waiter or `*** IMPORTED ORDER ***`.
   - Lists only lines belonging to that station.
-- [ ] Update `print_ticket(order_id)` and `maybe_autoprint(order_id)`:
-  - Generates and prints slips for each station.
-  - Emits full paper cut between slips.
+- [x] Update `print_ticket(order_id)` and `maybe_autoprint(order_id)`:
+  - Generates and routes one slip to each configured station printer.
+  - Each print job ends with a full paper cut.
   - Saves individual ticket logs in `data/tickets/`.
+- [x] Add settings for per-station kitchen printers, default kitchen fallback, and the required separate admin receipt printer.
 
 ### Phase 4: Admin Order Dashboard UI
-- [ ] Add new Admin tab: `['pos', '🛒 ' + tr('takeOrder')]`.
-- [ ] Reuse the catalog component from `app2.js` into an Admin POS view:
+- [x] Add new Admin tab: `['pos', '🛒 Take Order']`.
+- [x] Add an Admin top-bar quick action for starting a new order.
+- [x] Reuse the catalog component from `app2.js` into an Admin POS view:
   - Browse sections and items.
   - Configure dish sizes, choice groups, and notes.
-- [ ] Add `Imported` order toggle button:
+- [x] Add `Imported` order toggle button:
   - When toggled, eliminates table number requirement and automatically marks order as `order_type: 'imported'`.
-- [ ] Add "Send to Kitchen" button executing `POST /api/orders`.
-- [ ] Run `python3 build_app.py` to regenerate `app.html`.
+- [x] Add "Send to Kitchen" button executing `POST /api/orders`.
+- [x] Add explicit admin receipt printing to the required admin printer.
+- [x] Run `python3 build_app.py` to regenerate `app.html`.
 
 ### Phase 5: Test Suite & Verification
-- [ ] Add test cases to `test_server_features.py`:
+- [x] Add test cases to `test_server_features.py`:
   - Test creation of imported order with `table_no = 0`.
   - Test ticket splitting: verify that an order with items from two stations generates two distinct station slips.
   - Verify that imported orders do not require waiter attribution.
@@ -250,15 +256,8 @@ Items for this station: 3
 
 ---
 
-## 4. Key Architectural Decisions for Alignment
+## 4. Decisions Applied
 
-Before coding begins, please confirm preferences on the following:
-
-1. **Printer Output Strategy:**
-   - *Option A (Recommended):* Single printer prints each station slip sequentially with a paper cut after each station, so staff can tear and hand slips to respective cooks.
-   - *Option B:* Multi-printer configuration (each kitchen station has a designated printer IP in settings).
-2. **Admin Ordering Placement:**
-   - *Option A (Recommended):* A dedicated **🛒 Take Order** tab inside the Admin Dashboard, plus a quick-action button in the Admin top bar.
-   - *Option B:* A separate role on the home screen called **🖥️ Admin POS / Counter**.
-3. **Receipt Total on Station Slips:**
-   - Should station slips show prices/subtotals for their items, or should they function purely as kitchen production chits without prices? (Usually kitchen chits omit prices).
+- Kitchen station printers are configured individually, with the default kitchen printer as fallback.
+- The required admin printer handles explicit receipt printing only; kitchen orders go to station printers.
+- The admin ordering screen lives in a dedicated Admin Dashboard tab; station slips omit prices.

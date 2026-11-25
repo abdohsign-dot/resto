@@ -29,6 +29,29 @@ Use `python3 build_app.py --check` in CI. The build reads `top.html`, `mid.html`
   groups and their price-delta options from the dish editor. Variant prices and stock
   are stored in cents/integer units. A legacy `/api/items` read-only projection remains
   for compatibility.
+- **Admin POS and imported orders:** use **Take Order** or the **New Order** shortcut
+  in Administration to browse the same catalog as the waiter screen, select variants
+  and choices, add item and kitchen notes, and send an order. Choose Dine-in to enter a
+  table number or Imported for a non-table order. Imported orders are stored with
+  `order_type = imported`, table `0`, and no waiter; they appear as Imported in the Admin
+  orders list and KDS.
+- **Admin tables and settlement:** the **Tables** view lists dining tables and opens
+  each table's complete order history, including unpaid and paid orders. Only admins
+  settle balances. **Settle & print receipt** records the outstanding payment and sends
+  the receipt to the admin printer. Waiters can send and manage orders but do not print
+  tickets or request bills.
+- **Kitchen stations and printers:** assign a kitchen station to each section in the
+  kitchen configuration. Orders are grouped by station and kitchen slips are sent to
+  that station's configured printer. Each slip includes only that station's active
+  items, modifiers, and notes, and ends with a paper cut. Kitchen slips omit prices.
+  Stations without a dedicated address use the default kitchen printer. The older
+  `printer_ip` and `printer_port` settings continue to work as the default.
+- **Admin receipt printer:** configure its IP in Administration → Settings; it is
+  required when saving printer settings. It is separate from kitchen routing and never
+  receives automatic kitchen tickets. Recording a payment sends a priced receipt with
+  the payment method and remaining balance to this printer. **Print admin receipt** in
+  the Admin orders list reprints a receipt manually. The regular **Print** action still
+  opens the browser-printable ticket.
 - **Inventory:** a blank variant stock quantity means untracked stock. Tracked stock
   is decremented when an order is accepted and restored on cancellation. Every stock
   change is recorded in `stock_movements` in the same transaction.
@@ -37,10 +60,13 @@ Use `python3 build_app.py --check` in CI. The build reads `top.html`, `mid.html`
   uploads up to 2 MB are supported.
 - **Reservations:** record a guest, contact, date/time, party size, optional table, and
   status. These are staff-managed reservations, not a public booking calendar.
-- **Bills and payments:** waiters can request a bill. Admin can record cash, card, or
-  other payments, split payment by item quantities, and record refunds. This does not
-  connect to a payment processor.
-- **Sales:** view received payments and top ordered items for the last 7, 30, or 90 days.
+- **Payments:** admins settle outstanding order balances by cash, card, or other and
+  can record refunds. Receipts are printed locally; this does not connect to a payment
+  processor.
+- **Sales:** filter received payments and top ordered items by a 7-, 30-, or 90-day
+  preset or custom date range, time-of-day window, everyone, admin orders, all waiters,
+  or an individual waiter. Print the currently filtered report, including payment
+  details and totals.
 
 Existing SQLite databases are migrated on server startup. Legacy menu rows become
 one product plus one `Regular` default variant, preserving names and prices. Existing
@@ -72,7 +98,8 @@ python3 -m unittest -v test_server_features.py
 ```
 
 The tests cover database migration, branch isolation, stock handling, modifiers,
-payments/refunds, reservations, and image uploads.
+payments/refunds, reservations, image uploads, imported orders, station ticket splitting,
+and station/admin printer routing.
 
 ## Deployment notes
 

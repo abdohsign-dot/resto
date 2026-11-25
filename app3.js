@@ -30,14 +30,17 @@ function renderKitchen(app) {
       (list.map(kCard).join('') || '<div class="empty">' + tr('nothingHere') + '</div>') + '</div>';
   }).join('');
   app.innerHTML =
-    '<div class="topbar"><div class="tb-left"><span class="tb-title">👨‍🍳 ' + tr('kitchenRole') + '</span>' +
-      '<span class="tb-sub">' + esc(localizedLabel(S.data.restaurant)) + '</span></div>' +
+    '<div class="topbar"><div class="tb-left"><span class="tb-title">👨‍🍳 ' + tr('kitchenRole') + '</span></div>' +
       '<div class="tb-right">' + branchControl() + langControl() + '<button class="btn small" onclick="goHome()">⌂ ' + tr('home') + '</button>' + connDot() + '</div></div>' +
     '<div class="kds">' + html + '</div>';
 }
 function leaveRole() { goHome(); }
 
 function kCard(o) {
+  var isImported = o.order_type === 'imported' || o.table_no == 0;
+  var headerHtml = isImported
+    ? '<span class="ktable imported-badge">📦 IMPORTED #' + o.id + '</span>'
+    : '<span class="ktable">' + tr('table') + ' ' + o.table_no + '</span><span class="dim">' + esc(o.staff_name || '') + '</span>';
   var lines = o.lines.map(function (l) {
     var modifiers = lineModifiers(l.modifiers);
     if (!modifiers.length && l.modifiers_json) modifiers = lineModifiers(l.modifiers_json);
@@ -49,21 +52,15 @@ function kCard(o) {
       (modifiers.length ? '<span class="lnote">+ ' + esc(modifiers.map(function (m) { return m.name; }).join(', ')) + '</span>' : '') +
       (l.note ? '<span class="lnote">· ' + esc(l.note) + '</span>' : '') +
       '<span class="chip ' + l.status + '">' + (l.status === 'cancelled' ? '86' : tStatus(l.status)) + '</span>' +
-      (l.status !== 'cancelled' && o.status !== 'served'
-        ? '<button class="lx" title="' + tr('outOfStock') + '" onclick="event.stopPropagation();cancelLineDlg(' + o.id + ',' + l.id + ')">✕</button>'
-        : '') +
       '</div>';
   }).join('');
   var btns = '<div class="kbtns">';
   if (!S.kitchenStation && o.status === 'sent') btns += '<button class="btn small violet" onclick="startOrder(' + o.id + ')">▶ ' + tr('startCooking') + '</button>';
   if (!S.kitchenStation && (o.status === 'sent' || o.status === 'preparing')) btns += '<button class="btn small green" onclick="allReady(' + o.id + ')">✓ ' + tr('allReady') + '</button>';
-  btns += '<button class="btn small" onclick="printTicket(' + o.id + ')">🖨️ ' + tr('print') + '</button>';
-  if (o.status !== 'served') btns += '<button class="btn small danger" onclick="cancelOrderDlg(' + o.id + ')">✕ ' + tr('cancel') + '</button>';
-  btns += '</div>';
+  btns = btns === '<div class="kbtns">' ? '' : btns + '</div>';
   return '<div class="kcard st-' + o.status + '">' +
-    '<div class="khead"><span class="ktable">' + tr('table') + ' ' + o.table_no + '</span>' +
-    '<span class="dim">' + esc(o.staff_name || '') + '</span>' +
-    '<span class="kage ' + ageClass(o.created_at) + '">' + ageLabel(o.created_at) + '</span></div>' +
+    '<div class="khead' + (isImported ? ' khead-imported' : '') + '">' + headerHtml +
+    '<span class="kage"><span class="kdate">' + ticketDateTime(o.created_at) + '</span></span></div>' +
     lines +
     (o.note ? '<div class="knote">' + tr('notePrefix') + esc(o.note) + '</div>' : '') +
     btns + '</div>';
@@ -84,7 +81,11 @@ async function lineNext(orderId, lineId) {
 // ================= ADMIN =================
 function renderAdmin(app) {
   if (!S.adminPin) { renderAdminGate(app); return; }
+  if (S.adminTab === 'pos') { renderAdminPos(app); return; }
+  if (S.adminTab === 'tables' && S.adminTableNo) { renderAdminTablePage(app); return; }
   var tabs = [
+    ['pos', '🛒 Take Order'],
+    ['tables', '🪑 ' + tr('tableList')],
     ['sections', '🗂 ' + tr('sections')], ['items', '🍽 ' + tr('menuTab')],
     ['kitchen', '👨‍🍳 ' + tr('kitchenConfig')],
     ['waiters', '🧑‍🤝‍🧑 ' + tr('waiters')],
@@ -101,21 +102,55 @@ function renderAdmin(app) {
   else if (S.adminTab === 'kitchen') body = adminKitchen();
   else if (S.adminTab === 'waiters') body = adminWaiters();
   else if (S.adminTab === 'orders') body = adminOrders();
+  else if (S.adminTab === 'tables') body = adminTables();
   else if (S.adminTab === 'reservations') body = adminReservations();
   else if (S.adminTab === 'sales') body = adminAnalytics();
   else if (S.adminTab === 'branches') body = adminBranches();
   else body = adminSettings();
   app.innerHTML =
-    '<div class="topbar"><div class="tb-left"><span class="tb-title">⚙️ ' + tr('admin') + '</span>' +
-      '<span class="tb-sub">' + esc(localizedLabel(S.data.restaurant)) + '</span></div>' +
-      '<div class="tb-right">' + branchControl() + langControl() + '<button class="btn small" onclick="goHome()">⌂ ' + tr('home') + '</button>' + connDot() + '</div></div>' +
+    '<div class="topbar"><div class="tb-left"><span class="tb-title">⚙️ ' + tr('admin') + '</span></div>' +
+      '<div class="tb-right"><button class="btn small admin-back" onclick="backAdminTab()" aria-label="' + tr('back') + '">← ' + tr('back') + '</button>' + branchControl() + langControl() + '<button class="btn small primary" onclick="setTab(\'pos\')">🛒 New Order</button><button class="btn small" onclick="goHome()">⌂ ' + tr('home') + '</button>' + connDot() + '</div></div>' +
     '<div class="tabs">' + tabBtns + '</div>' +
     '<div class="pad">' + body + '</div>';
 }
-function setTab(t) {
-  S.adminTab = t; S.adminSearch = ''; render();
+function setTab(t, fromBack) {
+  if (!fromBack && S.adminTab !== t) {
+    S.adminTabHistory = S.adminTabHistory || [];
+    S.adminTabHistory.push(S.adminTab);
+    if (S.adminTabHistory.length > 30) S.adminTabHistory.shift();
+  }
+  S.adminTab = t; S.adminSearch = '';
+  if (t === 'tables') { S.adminTableNo = null; S.adminTableOrders = null; }
+  render();
   if (t === 'items') loadCatalogEditor();
-  if (t === 'sales') loadSales('7d');
+  if (t === 'pos') loadWaiterCatalog().then(function () { render(); }).catch(function (e) { toast(e.message || tr('needConnection')); });
+  if (t === 'sales') {
+    if (S.salesData) loadSales(S.salesPeriod || '7d');
+    else salesPreset('7d');
+  }
+}
+function backAdminTab() {
+  var history = S.adminTabHistory || [];
+  var previous = history.pop();
+  S.adminTabHistory = history;
+  setTab(previous || 'tables', true);
+}
+
+function renderAdminPos(app) {
+  if (S.adminOrderType === 'imported') S.tableNo = 0;
+  else S.tableNo = Math.max(1, parseInt(S.adminDineInTable, 10) || 1);
+  if (S.waiterCatalogLoadedFor !== S.branchId) {
+    loadWaiterCatalog().then(function () { render(); }).catch(function (e) { toast(e.message || tr('needConnection')); });
+  }
+  var tabs = [
+    ['pos','🛒 Take Order'], ['tables','🪑 ' + tr('tableList')], ['sections','🗂 ' + tr('sections')], ['items','🍽 ' + tr('menuTab')],
+    ['kitchen','👨‍🍳 ' + tr('kitchenConfig')], ['waiters','🧑‍🤝‍🧑 ' + tr('waiters')],
+    ['orders','🧾 ' + tr('orders')], ['reservations','🗓 ' + tr('reservations')],
+    ['sales','📈 ' + tr('sales')], ['branches','🏢 ' + tr('branch')], ['settings','⚙️ ' + tr('settings')]
+  ];
+  var tabBtns = tabs.map(function (t) { return '<button class="btn small ' + (S.adminTab === t[0] ? 'on' : '') + '" onclick="setTab(\'' + t[0] + '\')">' + t[1] + '</button>'; }).join('');
+  app.innerHTML = '<div class="topbar"><div class="tb-left"><button class="btn small admin-back" onclick="backAdminTab()" aria-label="' + tr('back') + '">← ' + tr('back') + '</button><span class="tb-title">⚙️ ' + tr('admin') + ' · 🛒 Take Order</span></div><div class="tb-right">' + branchControl() + langControl() + '<button class="btn small" onclick="goHome()">⌂ ' + tr('home') + '</button>' + connDot() + '</div></div>' +
+    '<div class="tabs">' + tabBtns + '</div>' + renderTableScreen(null, {name:'Admin'}, true);
 }
 
 // ---- PIN gate ----
@@ -123,7 +158,7 @@ var pinBuf = '';
 function renderAdminGate(app) {
   app.innerHTML =
     '<div class="topbar"><div class="tb-left"><span class="tb-title">⚙️ ' + tr('admin') + '</span></div>' +
-      '<div class="tb-right">' + langControl() + '<button class="btn small" onclick="leaveRole()">' + tr('roles') + '</button>' + connDot() + '</div></div>' +
+      '<div class="tb-right">' + langControl() + '<button class="btn small" onclick="leaveRole()">⌂ ' + tr('home') + '</button>' + connDot() + '</div></div>' +
     '<div class="role-wrap"><div class="brand">' + tr('restricted') + '</div><h1>' + tr('enterPin') + '</h1>' +
     '<div class="pindots" id="pindots"></div>' +
     '<div class="pinpad">' +
@@ -761,7 +796,7 @@ function adminKitchen() {
       return '<div class="station-card">' +
         '<div class="station-card-head">' +
           '<div class="station-card-title">🍳 ' + esc(st) + '</div>' +
-          '<button class="btn small" onclick="assignStaffDlg(\'' + esc(st).replace(/'/g, "\\'") + '\')">＋ ' + tr('assignStaff') + '</button>' +
+          '<button class="btn small" onclick="kitchenStaffDlg(0,\'' + esc(st).replace(/'/g, "\\'") + '\')">＋ ' + tr('newKitchenStaff') + '</button>' +
         '</div>' +
         '<div class="station-card-meta">' +
           '<b>' + tr('assignedStaff') + ' (' + stStaff.length + '):</b>' +
@@ -812,60 +847,21 @@ function adminKitchen() {
     (unassignedStaff.length ? '<button class="btn small ' + (activeFilter === '__unassigned__' ? 'on' : '') + '" onclick="setKitchenFilter(\'__unassigned__\')">⚠ ' + tr('unassigned') + ' (' + unassignedStaff.length + ')</button>' : '') +
   '</div>';
 
-  // Section Routing Rows
-  var sectionRows = sections.map(function (sec) {
-    var curStation = (sec.kitchen_station || '').trim();
-    var options = '<option value="">-- ' + tr('unassigned') + ' --</option>' +
-      stations.map(function (st) {
-        return '<option value="' + esc(st) + '"' + (curStation === st ? ' selected' : '') + '>🍳 ' + esc(st) + '</option>';
-      }).join('') +
-      '<option value="__new__">＋ ' + tr('stationPick') + '...</option>';
-
-    return '<div class="kitchen-routing-row">' +
-      '<div style="display:flex;align-items:center;gap:10px;">' +
-        (sec.image_path ? '<img src="' + esc(sec.image_path) + '" style="width:36px;height:36px;border-radius:8px;object-fit:cover;">' : '<span style="font-size:24px;">🗂</span>') +
-        '<div><b>' + esc(localizedLabel(sec.name)) + '</b></div>' +
-      '</div>' +
-      '<div style="display:flex;align-items:center;gap:8px;">' +
-        '<label class="dim" style="font-size:13px;">' + tr('kitchenStation') + ':</label>' +
-        '<select class="in small" style="min-width:160px;padding:6px 8px;" onchange="changeSectionStation(' + sec.id + ', this.value)">' +
-          options +
-        '</select>' +
-      '</div>' +
-    '</div>';
-  }).join('');
-
   return '<div class="fabrow" style="gap:8px;flex-wrap:wrap;justify-content:space-between;align-items:center;">' +
-      '<div><h2 style="margin:0;font-size:20px;">👨‍🍳 ' + tr('kitchenConfig') + '</h2>' +
-      '<p class="dim" style="margin:4px 0 0;font-size:13.5px;">' + tr('routingHelp') + '</p></div>' +
-      '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
-        '<button class="btn primary" onclick="kitchenStaffDlg(0)">＋ ' + tr('newKitchenStaff') + '</button>' +
-        '<button class="btn" onclick="assignStaffDlg()">👤 ' + tr('assignStaff') + '</button>' +
-      '</div>' +
-    '</div>' +
-
-    '<div class="kitchen-section-title">' +
-      '<span>🍳 ' + tr('kitchenStations') + '</span>' +
+      '<h2 style="margin:0;font-size:20px;">👨‍🍳 ' + tr('kitchenConfig') + '</h2>' +
     '</div>' +
     '<div class="station-grid">' + stationCardsHtml + '</div>' +
 
     '<div class="kitchen-section-title">' +
       '<span>👨‍🍳 ' + tr('kitchenStaff') + ' (' + filteredStaff.length + ')</span>' +
-      '<button class="btn small primary" onclick="kitchenStaffDlg(0)">＋ ' + tr('newKitchenStaff') + '</button>' +
     '</div>' +
     filterChips +
-    '<div class="rows" style="margin-bottom:24px;">' + (staffRows || '<div class="empty">' + tr('noKitchenStaffYet') + '</div>') + '</div>' +
-
-    '<div class="kitchen-section-title">' +
-      '<span>🗂 ' + tr('menuSectionRouting') + '</span>' +
-    '</div>' +
-    '<p class="dim" style="margin:-4px 0 10px;font-size:13px;">' + tr('routingHelp') + '</p>' +
-    '<div class="rows">' + (sectionRows || '<div class="empty">' + tr('noSections') + '</div>') + '</div>';
+    '<div class="rows" style="margin-bottom:24px;">' + (staffRows || '<div class="empty">' + tr('noKitchenStaffYet') + '</div>') + '</div>';
 }
 
-function kitchenStaffDlg(id) {
+function kitchenStaffDlg(id, defaultStation) {
   var s = id ? (S.data.staff || []).filter(function (x) { return x.id === id; })[0]
-             : { name: '', role: 'kitchen', kitchen_station: '', active: 1, tables: '[]' };
+             : { name: '', role: 'kitchen', kitchen_station: defaultStation || '', active: 1, tables: '[]' };
   var sections = S.data.sections || [];
   var curStation = (s.kitchen_station || '').trim().toLowerCase();
   var sectionOptions = '';
@@ -1241,60 +1237,154 @@ async function saveBranch() {
     closeDlg(); poll(); toast(tr('branchCreated'));
   } catch (e) { toast(e.code ? e.message : tr('needConnection')); }
 }
+function salesDateValue(date) {
+  return date.getFullYear() + '-' + ('0' + (date.getMonth() + 1)).slice(-2) + '-' + ('0' + date.getDate()).slice(-2);
+}
+function salesPreset(period) {
+  var days = { '7d': 7, '30d': 30, '90d': 90 }[period];
+  S.salesPeriod = days ? period : 'custom';
+  if (days) {
+    var end = new Date();
+    var start = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+    start.setDate(start.getDate() - days + 1);
+    S.salesDateFrom = salesDateValue(start);
+    S.salesDateTo = salesDateValue(end);
+  }
+  loadSales(S.salesPeriod);
+}
 async function loadSales(period) {
-  S.salesPeriod = period;
+  if (period) S.salesPeriod = period;
+  var days = { '7d': 7, '30d': 30, '90d': 90 }[S.salesPeriod];
+  if (days) {
+    var end = new Date();
+    var start = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+    start.setDate(start.getDate() - days + 1);
+    S.salesDateFrom = salesDateValue(start); S.salesDateTo = salesDateValue(end);
+  } else {
+    S.salesDateFrom = val('sales-date-from') || S.salesDateFrom;
+    S.salesDateTo = val('sales-date-to') || S.salesDateTo;
+  }
+  S.salesTimeFrom = val('sales-time-from') || S.salesTimeFrom || '00:00';
+  S.salesTimeTo = val('sales-time-to') || S.salesTimeTo || '23:59';
+  S.salesActor = val('sales-actor') || S.salesActor || 'all';
+  var query = [
+    ['period', 'custom'], ['date_from', S.salesDateFrom], ['date_to', S.salesDateTo],
+    ['time_from', S.salesTimeFrom], ['time_to', S.salesTimeTo], ['actor', S.salesActor]
+  ].map(function (pair) { return encodeURIComponent(pair[0]) + '=' + encodeURIComponent(pair[1]); }).join('&');
   try {
-    S.salesData = await api('/api/sales?period=' + encodeURIComponent(period));
+    S.salesData = await api('/api/sales?' + query);
     if (S.adminTab === 'sales') render();
   } catch (e) { toast(e.code ? e.message : tr('needConnection')); }
 }
+function salesActorOptions() {
+  var options = [
+    ['all', tr('salesAll')], ['admin', tr('salesAdmins')], ['waiter', tr('salesAllWaiters')]
+  ];
+  (S.data.staff || []).filter(function (staff) { return (staff.role || 'waiter') === 'waiter'; })
+    .forEach(function (staff) { options.push(['waiter:' + staff.id, staff.name]); });
+  return options.map(function (option) {
+    return '<option value="' + esc(option[0]) + '"' + (S.salesActor === option[0] ? ' selected' : '') + '>' +
+      esc(option[1]) + '</option>';
+  }).join('');
+}
 function adminAnalytics() {
-  var data = S.salesData;
-  var daily = data && data.daily || [];
+  if (!S.salesDateFrom || !S.salesDateTo) salesPresetDatesOnly('7d');
+  var data = S.salesData || {};
+  var daily = data.daily || [], top = data.top_items || [], actors = data.by_actor || [];
   var max = daily.reduce(function (n, d) { return Math.max(n, d.revenue); }, 0) || 1;
-  var rows = daily.map(function (d) {
+  var dailyRows = daily.map(function (d) {
     return '<div class="row"><span class="grow">' + esc(d.day) + '</span><span class="chartbar" style="width:' +
       Math.max(2, Math.round(d.revenue / max * 100)) + '%"></span><b>' + money(d.revenue) + '</b></div>';
   }).join('');
-  var top = data && data.top_items || [];
-  return '<div class="searchrow"><label class="f">' + tr('analyticsPeriod') +
-    '</label><select class="in" style="width:auto" onchange="loadSales(this.value)">' +
-    ['7d','30d','90d'].map(function (p) { return '<option value="' + p + '"' +
-      ((S.salesPeriod || '7d') === p ? ' selected' : '') + '>' + p + '</option>'; }).join('') +
-    '</select></div><h3>' + tr('revenue') + '</h3><div class="rows">' +
-    (rows || '<div class="empty">' + tr('noSales') + '</div>') + '</div><h3>' +
-    tr('topItems') + '</h3><div class="rows">' + (top.map(function (i) {
-      return '<div class="row"><span class="grow">' + esc(i.name) + '</span><b>' +
-        i.quantity + ' × ' + money(i.value) + '</b></div>';
-    }).join('') || '<div class="empty">' + tr('noSales') + '</div>') + '</div>';
-}
-function paymentDlg(orderId) {
-  var order = (S.data.orders || []).filter(function (o) { return o.id === orderId; })[0];
-  if (!order || order.balance <= 0) return;
-  var lines = order.lines.filter(function (l) { return l.status !== 'cancelled'; }).map(function (l) {
-    var unpaidQty = Math.max(0, l.qty - Number(l.paid_qty || 0));
-    return '<div class="row"><span class="grow">' + l.qty + '× ' + esc(localizedLabel(l.name)) +
-      '</span><span>' + money(l.price) + '</span><input class="in pay-split-qty" type="number" min="0" max="' +
-      unpaidQty + '" step="1" value="0" data-id="' + l.id + '" data-price="' + l.price +
-      '" style="width:82px" aria-label="' + tr('splitItems') + '" onchange="paymentSplitAmount()"' +
-      (unpaidQty === 0 ? ' disabled' : '') + '></div>';
+  var actorRows = actors.map(function (row) {
+    return '<div class="row"><span class="grow">' + esc(row.name) + '</span><span>' +
+      row.payments + ' ' + tr('paymentCount').toLowerCase() + '</span><b>' + money(row.revenue) + '</b></div>';
   }).join('');
-  dlg('<h2>' + tr('recordPayment') + ' · ' + tr('ticket') + ' #' + orderId + '</h2>' +
-    '<p class="dim">' + tr('balance') + ': ' + money(order.balance) + '</p><label class="f">' +
-    tr('amount') + '</label><input id="f-p-amount" class="in" type="number" min="0.01" max="' +
-    order.balance + '" step="0.01" value="' + order.balance + '">' +
+  var itemRows = top.map(function (item) {
+    return '<div class="row"><span class="grow">' + esc(item.name) + '</span><b>' +
+      item.quantity + ' × ' + money(item.value) + '</b></div>';
+  }).join('');
+  var transactions = data.transactions || [];
+  var transactionRows = transactions.map(function (row) {
+    var target = row.order_type === 'imported' || row.table_no === 0
+      ? 'Imported #' + row.order_id : tr('table') + ' ' + row.table_no;
+    return '<div class="row"><span>' + esc(hhmm(row.created_at)) + '</span><span class="grow">' +
+      esc(row.actor_name) + '</span><span>' + esc(target) + '</span><span>' + tr(row.method) + '</span><b>' +
+      money(row.amount) + '</b></div>';
+  }).join('');
+  return '<div class="sales-filters">' +
+    '<label>' + tr('analyticsPeriod') + '<select id="sales-preset" class="in" onchange="salesPreset(this.value)">' +
+      ['7d','30d','90d','custom'].map(function (p) { return '<option value="' + p + '"' +
+        ((S.salesPeriod || '7d') === p ? ' selected' : '') + '>' + (p === 'custom' ? 'Custom' : p) + '</option>'; }).join('') +
+    '</select></label>' +
+    '<label>' + tr('salesFrom') + '<input id="sales-date-from" class="in" type="date" value="' + esc(S.salesDateFrom) + '"></label>' +
+    '<label>' + tr('salesTo') + '<input id="sales-date-to" class="in" type="date" value="' + esc(S.salesDateTo) + '"></label>' +
+    '<label>' + tr('salesTimeFrom') + '<input id="sales-time-from" class="in" type="time" value="' + esc(S.salesTimeFrom || '00:00') + '"></label>' +
+    '<label>' + tr('salesTimeTo') + '<input id="sales-time-to" class="in" type="time" value="' + esc(S.salesTimeTo || '23:59') + '"></label>' +
+    '<label>' + tr('salesActor') + '<select id="sales-actor" class="in">' + salesActorOptions() + '</select></label>' +
+    '<button class="btn primary" onclick="loadSales(\'custom\')">' + tr('applyFilters') + '</button>' +
+    '<button class="btn" onclick="printSalesReport()">🖨️ ' + tr('printReport') + '</button>' +
+    '</div>' +
+    '<div class="sales-summary"><div><span>' + tr('revenue') + '</span><b>' + money(data.total_revenue || 0) +
+    '</b></div><div><span>' + tr('paymentCount') + '</span><b>' + (data.payment_count || 0) + '</b></div>' +
+    '<div><span>' + tr('salesActor') + '</span><b>' + esc(data.actor === 'all' ? tr('salesAll') : data.actor === 'admin' ? tr('salesAdmins') :
+      data.actor === 'waiter' ? tr('salesAllWaiters') : ((S.data.staff || []).filter(function (s) { return 'waiter:' + s.id === data.actor; })[0] || {}).name || '') + '</b></div></div>' +
+    '<h3>' + tr('revenue') + '</h3><div class="rows">' + (dailyRows || '<div class="empty">' + tr('noSales') + '</div>') + '</div>' +
+    '<h3>' + tr('salesActor') + '</h3><div class="rows">' + (actorRows || '<div class="empty">' + tr('noSales') + '</div>') + '</div>' +
+    '<h3>' + tr('topItems') + '</h3><div class="rows">' + (itemRows || '<div class="empty">' + tr('noSales') + '</div>') + '</div>' +
+    '<h3>' + tr('transactions') + '</h3><div class="rows">' +
+      (transactionRows || '<div class="empty">' + tr('noSales') + '</div>') + '</div>';
+}
+function salesPresetDatesOnly(period) {
+  var days = { '7d': 7, '30d': 30, '90d': 90 }[period] || 7;
+  var end = new Date(), start = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  start.setDate(start.getDate() - days + 1);
+  S.salesPeriod = period; S.salesDateFrom = salesDateValue(start); S.salesDateTo = salesDateValue(end);
+}
+function printSalesReport() {
+  var data = S.salesData;
+  if (!data) return;
+  var win = window.open('', '_blank');
+  if (!win) { toast(tr('popupBlocked')); return; }
+  var actorName = data.actor === 'all' ? tr('salesAll') : data.actor === 'admin' ? tr('salesAdmins') :
+    data.actor === 'waiter' ? tr('salesAllWaiters') : ((S.data.staff || []).filter(function (s) {
+      return 'waiter:' + s.id === data.actor;
+    })[0] || {}).name || data.actor;
+  var transactions = (data.transactions || []).map(function (row) {
+    return '<tr><td>' + esc(hhmm(row.created_at)) + '</td><td>' + esc(row.actor_name) + '</td><td>' +
+      esc(row.order_type === 'imported' || row.table_no === 0 ? 'Imported #' + row.order_id : tr('table') + ' ' + row.table_no) +
+      '</td><td>' + esc(tr(row.method)) + '</td><td class="amount">' + esc(money(row.amount)) + '</td></tr>';
+  }).join('');
+  var actors = (data.by_actor || []).map(function (row) {
+    return '<tr><td>' + esc(row.name) + '</td><td>' + row.payments + '</td><td class="amount">' + esc(money(row.revenue)) + '</td></tr>';
+  }).join('');
+  var items = (data.top_items || []).map(function (row) {
+    return '<tr><td>' + esc(row.name) + '</td><td>' + row.quantity + '</td><td class="amount">' + esc(money(row.value)) + '</td></tr>';
+  }).join('');
+  win.document.write('<!doctype html><html><head><meta charset="utf-8"><title>' + esc(tr('sales')) + '</title>' +
+    '<style>body{font:14px Arial,sans-serif;margin:24px;color:#17212e}h1{margin-bottom:4px}p{color:#526175}table{width:100%;border-collapse:collapse;margin:10px 0 24px}th,td{border-bottom:1px solid #ccd3dc;padding:7px;text-align:left}.amount{text-align:right}header{display:flex;justify-content:space-between}@media print{button{display:none}}</style>' +
+    '</head><body><header><div><h1>' + esc(tr('sales')) + '</h1><p>' + esc(data.date_from) + ' – ' + esc(data.date_to) +
+    ' · ' + esc(data.time_from) + '–' + esc(data.time_to) + ' · ' + esc(actorName) + '</p></div><button onclick="window.print()">' +
+    esc(tr('printReport')) + '</button></header><h2>' + esc(tr('revenue')) + ': ' + esc(money(data.total_revenue)) +
+    ' · ' + esc(tr('paymentCount')) + ': ' + data.payment_count + '</h2><h3>' + esc(tr('salesActor')) +
+    '</h3><table><tbody>' + actors + '</tbody></table><h3>' + esc(tr('topItems')) + '</h3><table><tbody>' + items +
+    '</tbody></table><h3>' + esc(tr('transactions')) + '</h3><table><thead><tr><th>' + esc(tr('dateColumn')) + '</th><th>' +
+    esc(tr('actorColumn')) + '</th><th>' + esc(tr('orderColumn')) + '</th><th>' + esc(tr('methodColumn')) + '</th><th>' +
+    esc(tr('amountColumn')) + '</th></tr></thead><tbody>' + transactions + '</tbody></table></body></html>');
+  win.document.close(); win.focus(); win.print();
+}
+function paymentDlg(orderId, balanceOverride) {
+  var order = (S.data.orders || []).filter(function (o) { return o.id === orderId; })[0];
+  var balance = Number(balanceOverride != null ? balanceOverride : order && order.balance);
+  if (!isFinite(balance) || balance <= 0) return;
+  dlg('<h2>' + tr('settleAndPrint') + ' · ' + tr('ticket') + ' #' + orderId + '</h2>' +
+    '<p class="dim">' + tr('balanceDue') + ': <b>' + money(balance) + '</b></p>' +
+    '<input id="f-p-amount" type="hidden" value="' + balance + '">' +
     '<label class="f">' + tr('method') + '</label><select id="f-p-method" class="in">' +
     ['cash','card','other'].map(function (m) { return '<option value="' + m + '">' + tr(m) + '</option>'; }).join('') +
-    '</select><h3>' + tr('splitItems') + '</h3><div class="rows">' + lines + '</div>' +
+    '</select><p class="dim">' + tr('settleAndPrint') + '</p>' +
     '<div class="dlg-foot"><button class="btn" onclick="closeDlg()">' + tr('cancel') + '</button>' +
-    '<button class="btn primary" onclick="savePayment(' + orderId + ')">' + tr('save') + '</button></div>');
-}
-function paymentSplitAmount() {
-  var inputs = Array.prototype.slice.call(document.querySelectorAll('.pay-split-qty'));
-  var selected = inputs.filter(function (el) { return Number(el.value) > 0; });
-  if (!selected.length) return;
-  var amount = selected.reduce(function (n, el) { return n + Number(el.dataset.price) * Number(el.value); }, 0);
-  document.getElementById('f-p-amount').value = amount.toFixed(2);
+    '<button class="btn primary" onclick="savePayment(' + orderId + ')">' + tr('settleAndPrint') + '</button></div>');
 }
 function refundDlg(paymentId, remaining) {
   dlg('<h2>' + tr('refund') + '</h2><label class="f">' + tr('refundAmount') +
@@ -1312,19 +1402,86 @@ async function saveRefund(paymentId) {
   } catch (e) { toast(e.code ? e.message : tr('needConnection')); }
 }
 async function savePayment(orderId) {
-  var inputs = Array.prototype.slice.call(document.querySelectorAll('.pay-split-qty'));
-  var allocations = inputs.filter(function (el) { return Number(el.value) > 0; }).map(function (el) {
-    return { line_id: Number(el.dataset.id), qty: Number(el.value) };
-  });
   try {
-    await api('/api/orders/' + orderId + '/payments', 'POST', {
-      amount: Number(val('f-p-amount')), method: val('f-p-method'), allocations: allocations
+    var result = await api('/api/orders/' + orderId + '/payments', 'POST', {
+      amount: Number(val('f-p-amount')), method: val('f-p-method')
     });
-    closeDlg(); poll(); toast(tr('saved'));
+    closeDlg(); await poll();
+    if (S.adminTab === 'tables' && S.adminTableNo) await loadAdminTableHistory(S.adminTableNo);
+    toast(result.receipt_printed ? tr('paymentRecorded') : tr('paymentRecorded') + ' ' + tr('receiptPrintFailed') + (result.receipt_error || ''));
   } catch (e) { toast(e.code ? e.message : tr('needConnection')); }
 }
 
 // ---- orders tab ----
+function adminTables() {
+  var found = {};
+  (S.data.table_numbers || []).forEach(function (n) { if (Number(n) > 0) found[Number(n)] = true; });
+  (S.data.staff || []).filter(function (s) { return s.role !== 'kitchen'; }).forEach(function (s) {
+    parseTables(s.tables).forEach(function (n) { if (Number(n) > 0) found[Number(n)] = true; });
+  });
+  (S.data.orders || []).forEach(function (o) { if (o.table_no > 0) found[o.table_no] = true; });
+  var tableNos = Object.keys(found).map(Number).sort(function (a, b) { return a - b; });
+  var cards = tableNos.map(function (tableNo) {
+    var orders = (S.data.orders || []).filter(function (o) { return o.table_no === tableNo; });
+    var active = orders.filter(function (o) { return o.status === 'sent' || o.status === 'preparing' || o.status === 'ready'; });
+    var due = orders.filter(function (o) { return o.status !== 'cancelled'; })
+      .reduce(function (sum, o) { return sum + Number(o.balance || 0); }, 0);
+    return '<button class="admin-table-card" onclick="loadAdminTableHistory(' + tableNo + ')">' +
+      '<b>' + tr('table') + ' ' + tableNo + '</b><span>' + active.length + ' ' + tr('ordersCount') + '</span>' +
+      '<strong>' + tr('balanceDue') + ': ' + money(due) + '</strong></button>';
+  }).join('');
+  return '<h2>' + tr('tableList') + '</h2><div class="admin-tables-grid">' +
+    (cards || '<div class="empty">' + tr('noTables') + '</div>') + '</div>';
+}
+function adminTableHistoryBody() {
+  var history = (S.adminTableOrders || []).map(function (o) {
+    var lineRows = (o.lines || []).map(function (line) {
+      var modifiers = lineModifiers(line.modifiers);
+      if (!modifiers.length && line.modifiers_json) modifiers = lineModifiers(line.modifiers_json);
+      var isDeletedChoicePlaceholder = /^TESTCHOICE_DELETE_ME$/i.test(String(line.name || ''));
+      var displayName = isDeletedChoicePlaceholder && modifiers.length
+        ? modifiers.map(function (mod) { return localizedLabel(mod.name); }).join(' + ')
+        : localizedLabel(line.name);
+      return '<div class="row history-line"><span class="grow">' + line.qty + '× ' + esc(displayName) +
+        (!isDeletedChoicePlaceholder && line.variant_name ? ' (' + esc(localizedLabel(line.variant_name)) + ')' : '') +
+        (line.status === 'cancelled' ? ' · ' + tr('cancelled') : '') + '</span><span>' +
+        (line.status === 'cancelled' ? '—' : money(line.price * line.qty)) + '</span></div>';
+    }).join('');
+    var paymentRows = (o.payments || []).map(function (p) {
+      return '<div class="row"><span class="grow">' + hhmm(p.created_at) + ' · ' + tr(p.method) +
+        '</span><b>' + money(p.amount - p.refunded_amount) + '</b></div>';
+    }).join('');
+    var actions = o.balance > 0.005 && o.status !== 'cancelled'
+      ? '<button class="btn small primary" onclick="paymentDlg(' + o.id + ',' + Number(o.balance) + ')">' + tr('settleAndPrint') + '</button>'
+      : (o.paid > 0 ? '<button class="btn small" onclick="printAdminReceipt(' + o.id + ')">🧾 ' + tr('print') + '</button>' : '');
+    return '<article class="table-history-order"><div class="thead"><b>' + tr('ticket') + ' #' + o.id +
+      ' · ' + hhmm(o.created_at) + '</b><span class="chip ' + o.status + '">' + tStatus(o.status) + '</span></div>' +
+      '<div class="dim">' + esc(o.order_type === 'imported' ? 'Imported' : (o.staff_name || 'Admin')) + '</div>' +
+      '<div class="rows">' + lineRows + '</div>' + (o.note ? '<div class="tnote">' + tr('notePrefix') + esc(o.note) + '</div>' : '') +
+      '<div class="row"><span class="grow">' + tr('paidLabel') + ': ' + money(o.paid) +
+      ' · ' + tr('balanceDue') + ': ' + money(o.balance) + '</span><b>' + money(o.total) + '</b></div>' +
+      (paymentRows ? '<h4>' + tr('payment') + '</h4>' + paymentRows : '<p class="dim">' + tr('unpaidLabel') + '</p>') +
+      '<div class="dlg-foot">' + actions + '</div></article>';
+  }).join('');
+  return '<section class="table-history"><h3>' + tr('tableHistory') + ' · ' + S.adminTableNo + '</h3>' +
+    (history || '<div class="empty">' + tr('noTableOrders') + '</div>') + '</section>';
+}
+function renderAdminTablePage(app) {
+  var title = tr('table') + ' ' + S.adminTableNo + ' · ' + tr('tableHistory');
+  app.innerHTML = '<div class="topbar"><div class="tb-left"><button class="btn small" aria-label="' + tr('tableList') + '" onclick="backToAdminTables()">← ' + tr('tableList') + '</button><span class="tb-title">' + title + '</span></div>' +
+    '<div class="tb-right">' + branchControl() + langControl() + '<button class="btn small" onclick="goHome()">⌂ ' + tr('home') + '</button>' + connDot() + '</div></div>' +
+    '<div class="pad">' + (S.adminTableOrders === null ? '<div class="loading">' + tr('loading') + '</div>' : adminTableHistoryBody()) + '</div>';
+}
+function backToAdminTables() {
+  S.adminTableNo = null; S.adminTableOrders = null; render();
+}
+async function loadAdminTableHistory(tableNo) {
+  S.adminTableNo = parseInt(tableNo, 10); S.adminTableOrders = null; render();
+  try {
+    var result = await api('/api/orders/history?table_no=' + encodeURIComponent(S.adminTableNo));
+    S.adminTableOrders = result.orders || []; render();
+  } catch (e) { S.adminTableOrders = []; render(); toast(e.code ? e.message : tr('needConnection')); }
+}
 function adminOrders() {
   var orders = (S.data.orders || []).slice().sort(function (a, b) { return b.created_at - a.created_at; });
   var rows = orders.map(function (o) {
@@ -1338,17 +1495,16 @@ function adminOrders() {
     }).join('');
     return '<div class="row">' +
       '<span>' + tr('ticket') + ' <b>#' + o.id + '</b> ' + hhmm(o.created_at) + '</span>' +
-      '<span class="tag">' + tr('table') + ' ' + o.table_no + '</span>' +
-      '<span class="grow">' + esc(o.staff_name || '') + ' · ' + n + ' ' + (n === 1 ? tr('itemSingular') : tr('itemsPlural')) +
+      '<span class="tag">' + (o.order_type === 'imported' || o.table_no === 0 ? '📦 Imported #' + o.id : tr('table') + ' ' + o.table_no) + '</span>' +
+      '<span class="grow">' + (o.order_type === 'imported' ? '' : esc(o.staff_name || '') + ' · ') + n + ' ' + (n === 1 ? tr('itemSingular') : tr('itemsPlural')) +
         (o.cancel_reason ? ' · <span style="color:#dc2626">' + esc(o.cancel_reason) + '</span>' : '') + '</span>' +
       '<span class="bigprice">' + money(o.total) + '</span>' +
       '<span class="tag">' + tr('paid') + ': ' + money(o.paid || 0) + ' · ' + tr('balance') + ': ' + money(o.balance || 0) + '</span>' +
       '</div>' + payments + '<div class="row">' +
-      (o.bill_requested ? '<span class="tag on">' + tr('requestBill') + '</span>' : '') +
       '<span class="chip ' + o.status + '">' + tStatus(o.status) + '</span>' +
       (o.balance > 0 && o.status !== 'cancelled'
-        ? '<button class="btn small primary" onclick="paymentDlg(' + o.id + ')">' + tr('recordPayment') + '</button>' : '') +
-      '<button class="btn small" onclick="printTicket(' + o.id + ')">🖨️ ' + tr('print') + '</button>' +
+        ? '<button class="btn small primary" onclick="paymentDlg(' + o.id + ',' + Number(o.balance) + ')">' + tr('settleAndPrint') + '</button>'
+        : (o.paid > 0 ? '<button class="btn small" onclick="printAdminReceipt(' + o.id + ')">🧾 ' + tr('print') + '</button>' : '')) +
       (o.status !== 'served' && o.status !== 'cancelled'
         ? '<button class="btn small danger" onclick="cancelOrderDlg(' + o.id + ')">✕</button>' : '') +
       '</div>';
@@ -1360,36 +1516,99 @@ function adminOrders() {
 // ---- settings tab ----
 function adminSettings() {
   var st = S.data.settings || {};
-  return '<div style="max-width:560px">' +
+  var printers = st.printers || {};
+  var defaultPrinter = printers.default || {};
+  if (!defaultPrinter.ip && st.printer_ip) defaultPrinter = { ip: st.printer_ip, port: st.printer_port || 9100 };
+  var adminPrinter = printers.admin || { ip: '', port: 9100 };
+  var stationNames = {};
+  (S.data.sections || []).forEach(function (section) {
+    var name = (section.kitchen_station || section.name || '').trim();
+    if (name) stationNames[name] = true;
+  });
+  var stationRows = Object.keys(stationNames).sort().map(function (name, index) {
+    var p = ((printers.stations || {})[name]) || { ip: '', port: 9100 };
+    return '<div class="printer-route"><b>' + esc(name) + '</b><input class="in" id="f-s-station-ip-' + index + '" value="' + esc(p.ip || '') + '" placeholder="Printer IP"><input class="in" id="f-s-station-port-' + index + '" type="number" value="' + esc(p.port || 9100) + '"></div>';
+  }).join('');
+  return '<div style="max-width:760px">' +
     '<h3>' + tr('restaurant') + '</h3>' +
     '<label class="f">' + tr('printedName') + '</label><input id="f-s-name" class="in" value="' + esc(st.restaurant_name || '') + '">' +
+    '<label class="f">Restaurant logo</label>' +
+    '<p class="dim">Optional. Add a name, a logo, or both. The large logo is used on Home; the compact logo is used on app screens and tickets.</p>' +
+    (st.restaurant_logo ? '<div class="settings-logo-preview"><img src="' + esc(st.restaurant_logo) + '" alt="Home logo"><button class="btn small danger" onclick="removeRestaurantLogo(\'home\')">Remove home logo</button></div>' : '') +
+    '<label class="f">Home logo</label><input id="f-s-logo" class="in" type="file" accept="image/png,image/jpeg,image/webp">' +
+    (st.restaurant_logo_compact ? '<div class="settings-logo-preview"><img src="' + esc(st.restaurant_logo_compact) + '" alt="Compact logo"><button class="btn small danger" onclick="removeRestaurantLogo(\'compact\')">Remove compact logo</button></div>' : '') +
+    '<label class="f">Compact logo for app and tickets</label><input id="f-s-logo-compact" class="in" type="file" accept="image/png,image/jpeg,image/webp">' +
     '<label class="f">' + tr('currency') + '</label><input id="f-s-cur" class="in" value="' + esc(st.currency || 'MAD') + '" maxlength="4">' +
-    '<h3 style="margin-top:26px">' + tr('ticketPrinter') + '</h3>' +
-    '<p class="dim">' + tr('printerHelp') + '</p>' +
-    '<label class="f">' + tr('printerIp') + '</label><input id="f-s-ip" class="in" value="' + esc(st.printer_ip || '') + '" placeholder="' + tr('printerIpPlaceholder') + '">' +
-    '<label class="f">' + tr('printerPort') + '</label><input id="f-s-port" class="in" type="number" value="' + esc(st.printer_port || 9100) + '">' +
-    '<label class="f"><input type="checkbox" id="f-s-auto"' + (st.autoprint ? ' checked' : '') + '> ' + tr('autoPrint') + '</label>' +
+    '<h3 style="margin-top:26px">Kitchen and receipt printers</h3>' +
+    '<p class="dim">Route each kitchen station to its own printer. Stations without an address use the default kitchen printer. The admin printer receives the full priced receipt.</p>' +
+    '<label class="f">Default kitchen printer IP</label><input id="f-s-ip" class="in" value="' + esc(defaultPrinter.ip || '') + '" placeholder="' + tr('printerIpPlaceholder') + '">' +
+    '<label class="f">Default kitchen printer port</label><input id="f-s-port" class="in" type="number" value="' + esc(defaultPrinter.port || 9100) + '">' +
+    '<label class="f">Admin receipt printer IP (required)</label><input id="f-s-admin-ip" class="in" required value="' + esc(adminPrinter.ip || '') + '" placeholder="' + tr('printerIpPlaceholder') + '">' +
+    '<label class="f">Admin receipt printer port</label><input id="f-s-admin-port" class="in" type="number" value="' + esc(adminPrinter.port || 9100) + '">' +
+    '<h4>Station printers</h4>' + (stationRows || '<p class="dim">No kitchen sections are configured.</p>') +
+    '<p class="dim printer-auto-note">Kitchen tickets print automatically when an order is sent. Configure a printer for each kitchen section above.</p>' +
     '<div class="dlg-foot" style="justify-content:flex-start"><button class="btn primary" onclick="saveSettings()">' + tr('saveSettings') + '</button></div>' +
     '<h3 style="margin-top:26px">' + tr('security') + '</h3>' +
     '<label class="f">' + tr('newAdminPin') + '</label>' +
     '<div class="searchrow"><input id="f-s-pin" class="in" type="password" inputmode="numeric" placeholder="' + tr('newPinPlaceholder') + '">' +
     '<button class="btn" style="flex:0 0 auto" onclick="changePin()">' + tr('changePin') + '</button></div>' +
-    '<h3 style="margin-top:26px">' + tr('data') + '</h3>' +
-    '<p class="dim">' + tr('localDataHelp') + ' ' +
-    tr('serverAddressLabel') + ' <b>' + esc(window.location.host) + '</b></p>' +
-    '<button class="btn" onclick="exportData()">' + tr('exportData') + '</button>' +
     '</div>';
 }
 async function saveSettings() {
+  var defaultIp = val('f-s-ip'), defaultPort = parseInt(val('f-s-port') || '9100', 10) || 9100;
+  var adminIp = val('f-s-admin-ip');
+  if (!adminIp) { toast('Admin receipt printer IP is required'); return; }
+  var stations = {}, stationIndex = 0;
+  Object.keys((function () { var names = {}; (S.data.sections || []).forEach(function (section) { var name = (section.kitchen_station || section.name || '').trim(); if (name) names[name] = true; }); return names; })()).sort().forEach(function (name) {
+    var ip = val('f-s-station-ip-' + stationIndex), port = parseInt(val('f-s-station-port-' + stationIndex) || '9100', 10) || 9100;
+    stations[name] = { ip: ip, port: port };
+    stationIndex++;
+  });
   var body = {
-    restaurant_name: val('f-s-name') || 'My Restaurant',
+    restaurant_name: val('f-s-name'),
     currency: val('f-s-cur') || 'MAD',
-    printer_ip: val('f-s-ip'),
-    printer_port: parseInt(val('f-s-port') || '9100') || 9100,
-    autoprint: chk('f-s-auto')
+    printer_ip: defaultIp,
+    printer_port: defaultPort,
+    printers: {
+      default: { ip: defaultIp, port: defaultPort },
+      admin: { ip: adminIp, port: parseInt(val('f-s-admin-port') || '9100', 10) || 9100 },
+      stations: stations
+    },
+    autoprint: true
   };
+  var logoFile = document.getElementById('f-s-logo').files[0];
+  var compactLogoFile = document.getElementById('f-s-logo-compact').files[0];
+  async function encodeLogo(file) {
+    if (!file) return null;
+    if (file.size > 2000000) throw new Error('Logo image must be at most 2 MB');
+    var dataUrl = await new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(reader.result); };
+      reader.onerror = function () { reject(new Error('Could not read logo image')); };
+      reader.readAsDataURL(file);
+    });
+    return { mime: file.type, data: String(dataUrl).split(',')[1] };
+  }
+  try {
+    var logoUpload = await encodeLogo(logoFile);
+    var compactUpload = await encodeLogo(compactLogoFile);
+    if (logoUpload) body.restaurant_logo_upload = logoUpload;
+    if (compactUpload) body.restaurant_logo_compact_upload = compactUpload;
+  } catch (e) { toast(e.message); return; }
   try { await api('/api/settings', 'PUT', body); toast(tr('settingsSaved')); poll(); }
   catch (e) { toast(e.code ? e.message : tr('needConnection')); }
+}
+async function removeRestaurantLogo(which) {
+  var body = which === 'compact' ? { restaurant_logo_compact: '' } : { restaurant_logo: '' };
+  try { await api('/api/settings', 'PUT', body); toast(tr('settingsSaved')); poll(); }
+  catch (e) { toast(e.code ? e.message : tr('needConnection')); }
+}
+async function printAdminReceipt(orderId) {
+  try {
+    var result = await api('/api/print/' + orderId, 'POST', {});
+    if (result.printed) toast('Admin receipt printed');
+    else toast(result.error || 'Admin printer unavailable');
+  } catch (e) { toast(e.code ? e.message : tr('needConnection')); }
 }
 async function changePin() {
   var p = val('f-s-pin');

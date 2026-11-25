@@ -20,6 +20,10 @@ function hhmm(ts) {
   var mi = ('0' + d.getMinutes()).slice(-2);
   return dd + '/' + mm + '/' + yyyy + ' ' + hh + ':' + mi;
 }
+function ticketDateTime(ts) {
+  var d = new Date(ts * 1000);
+  return hhmm(ts) + ':' + ('0' + d.getSeconds()).slice(-2);
+}
 function ageMin(ts) { return Math.max(0, Math.round((Date.now() / 1000 - S.skew - ts) / 60)); }
 function ageLabel(ts) {
   var m = ageMin(ts), h = Math.floor(m / 60), r = m % 60;
@@ -55,8 +59,10 @@ var S = {
   catalogRev: null,
   branchId: 1,
   tableNo: null, search: '', sectionFilter: 0, adminTab: 'sections',
+  adminOrderType: 'imported', adminDineInTable: 1, adminTableNo: null, adminTableOrders: null,
   adminItemFilter: 0, adminSearch: '', adminNodePath: [], cart: {}, queue: [], seen: {}, pollT: null,
   adminPin: null, lang: 'fr',
+  salesDateFrom: '', salesDateTo: '', salesTimeFrom: '00:00', salesTimeTo: '23:59', salesActor: 'all', salesPeriod: '7d',
   catalogProducts: [], catalogGroups: [], catalogLoadedFor: null, adminProductId: null,
   waiterCatalogLoadedFor: null, waiterProducts: [], waiterGroups: {}, menuPath: [],
   kitchenStation: null, kitchenStationFilter: null, adminKitchenStationFilter: ''
@@ -87,6 +93,8 @@ var I18N = {
     createGroup: 'Créer le groupe', noChoiceGroups: 'Aucun groupe de choix.',
     noChildren: 'Aucun élément ici.', noOptions: 'Aucune option.',
     review: 'Voir la commande', reviewOrder: 'Vérifier la commande', keepEditing: 'Continuer les modifications',
+    cancelDraft: 'Annuler la commande', discardDraftPrompt: 'Les articles de ce panier seront supprimés.', draftCancelled: 'Commande annulée.',
+    removeDraftItem: 'Retirer',
     sendKitchen: 'Envoyer en cuisine', print: 'Imprimer', served: 'Servi', cancel: 'Annuler',
     ticket: 'Ticket', noteKitchen: 'Note pour la cuisine (allergie, timing...)',
     noteOptional: 'facultatif', new: 'Nouvelles', preparing: 'En préparation',
@@ -150,13 +158,22 @@ var I18N = {
     partySize: 'Nombre de personnes', reservationNote: 'Note', booked: 'Réservée', seated: 'Installée',
     noShow: 'Absent', createReservation: 'Ajouter une réservation', sales: 'Ventes',
     payment: 'Paiement', recordPayment: 'Enregistrer un paiement', amount: 'Montant',
+    settleAndPrint: 'Régler et imprimer', paymentRecorded: 'Paiement enregistré.', receiptPrintFailed: 'Paiement enregistré, mais impression impossible : ',
+    tableList: 'Tables', tableHistory: 'Historique de la table', noTableOrders: 'Aucune commande pour cette table.',
+    balanceDue: 'Reste à payer', paidLabel: 'Payé', unpaidLabel: 'À payer', ordersCount: 'commandes',
     method: 'Mode de paiement', cash: 'Espèces', card: 'Carte', other: 'Autre',
     splitItems: 'Répartir par articles', paid: 'Payé', balance: 'À payer', requestBill: 'Demander l’addition',
     analyticsPeriod: 'Période', topItems: 'Articles les plus vendus', revenue: 'Recettes encaissées',
+    salesFrom: 'Du', salesTo: 'Au', salesTimeFrom: 'De l’heure', salesTimeTo: 'À l’heure',
+    salesActor: 'Serveur / admin', salesAll: 'Tout le monde', salesAdmins: 'Administration',
+    salesAllWaiters: 'Tous les serveurs', applyFilters: 'Appliquer les filtres', printReport: 'Imprimer le rapport',
+    paymentCount: 'Paiements', transactions: 'Détail des paiements', actorColumn: 'Serveur / admin',
+    dateColumn: 'Date et heure', orderColumn: 'Commande', amountColumn: 'Montant', methodColumn: 'Mode',
+    popupBlocked: 'Autorisez la fenêtre d’impression pour imprimer ce rapport.',
     newBranch: 'Nouvel établissement', copyMenu: 'Copier le menu et le personnel actuels',
     stock: 'Stock restant (vide = non suivi)', image: 'Image du plat', modifiers: 'Options (une par ligne : nom:prix)',
     noReservations: 'Aucune réservation à venir.', branchCreated: 'Établissement créé',
-    inventory: 'Stock', noSales: 'Aucune vente enregistrée pour cette période.',
+    inventory: 'Stock', noSales: 'Aucun paiement enregistré sur cette période. Enregistrez un paiement depuis Commandes pour comptabiliser une vente.',
     refund: 'Rembourser', refundAmount: 'Montant à rembourser', paymentRefunded: 'Remboursement enregistré',
     staffPin: 'Code PIN (laisser vide = sans code)', staffRole: 'Rôle', kitchenStation: 'Poste cuisine',
     allStations: 'Tous les postes', enterStaffPin: 'Entrez votre code', waiterRoleLabel: 'Serveur',
@@ -199,6 +216,8 @@ var I18N = {
     createGroup: 'إنشاء المجموعة', noChoiceGroups: 'لا توجد مجموعات خيارات.',
     noChildren: 'لا توجد عناصر هنا.', noOptions: 'لا توجد خيارات.',
     review: 'مراجعة الطلب', reviewOrder: 'مراجعة الطلب', keepEditing: 'متابعة',
+    cancelDraft: 'إلغاء الطلب', discardDraftPrompt: 'سيتم حذف العناصر من السلة.', draftCancelled: 'تم إلغاء الطلب.',
+    removeDraftItem: 'إزالة',
     sendKitchen: 'إرسال للمطبخ', print: 'طباعة', served: 'تم التقديم', cancel: 'إلغاء',
     ticket: 'تذكرة', noteKitchen: 'ملاحظة للمطبخ (حساسية، توقيت...)',
     noteOptional: 'اختياري', new: 'جديد', preparing: 'قيد التحضير',
@@ -261,13 +280,22 @@ var I18N = {
     partySize: 'عدد الأشخاص', reservationNote: 'ملاحظة', booked: 'محجوز', seated: 'تم التسكين',
     noShow: 'لم يحضر', createReservation: 'إضافة حجز', sales: 'المبيعات',
     payment: 'الدفع', recordPayment: 'تسجيل دفعة', amount: 'المبلغ',
+    settleAndPrint: 'تسديد وطباعة', paymentRecorded: 'تم تسجيل الدفعة.', receiptPrintFailed: 'تم تسجيل الدفعة لكن تعذرت الطباعة: ',
+    tableList: 'الطاولات', tableHistory: 'سجل الطاولة', noTableOrders: 'لا توجد طلبات لهذه الطاولة.',
+    balanceDue: 'المبلغ المتبقي', paidLabel: 'مدفوع', unpaidLabel: 'غير مدفوع', ordersCount: 'طلبات',
     method: 'طريقة الدفع', cash: 'نقدا', card: 'بطاقة', other: 'أخرى',
     splitItems: 'تقسيم حسب الأصناف', paid: 'مدفوع', balance: 'المتبقي', requestBill: 'طلب الفاتورة',
     analyticsPeriod: 'الفترة', topItems: 'الأصناف الأكثر مبيعا', revenue: 'الإيرادات المحصلة',
+    salesFrom: 'من تاريخ', salesTo: 'إلى تاريخ', salesTimeFrom: 'من الساعة', salesTimeTo: 'إلى الساعة',
+    salesActor: 'النادل / الإدارة', salesAll: 'الجميع', salesAdmins: 'الإدارة',
+    salesAllWaiters: 'كل النادلين', applyFilters: 'تطبيق التصفية', printReport: 'طباعة التقرير',
+    paymentCount: 'الدفعات', transactions: 'تفاصيل الدفعات', actorColumn: 'النادل / الإدارة',
+    dateColumn: 'التاريخ والوقت', orderColumn: 'الطلب', amountColumn: 'المبلغ', methodColumn: 'الطريقة',
+    popupBlocked: 'اسمح بالنافذة المنبثقة لطباعة التقرير.',
     newBranch: 'فرع جديد', copyMenu: 'نسخ القائمة والموظفين الحاليين',
     stock: 'المخزون المتبقي (فارغ = غير متتبع)', image: 'صورة الطبق', modifiers: 'الخيارات (سطر لكل خيار: الاسم:السعر)',
     noReservations: 'لا توجد حجوزات قادمة.', branchCreated: 'تم إنشاء الفرع',
-    inventory: 'المخزون', noSales: 'لا توجد مبيعات مسجلة لهذه الفترة.',
+    inventory: 'المخزون', noSales: 'لا توجد دفعات مسجلة خلال هذه الفترة. سجّل دفعة من صفحة الطلبات لاحتساب البيع.',
     refund: 'استرداد', refundAmount: 'مبلغ الاسترداد', paymentRefunded: 'تم تسجيل الاسترداد',
     pageTitle: 'طلبات المطعم',
     staffPin: 'رمز PIN (اتركه فارغاً = بدون رمز)', staffRole: 'الدور', kitchenStation: 'محطة المطبخ',
@@ -311,6 +339,8 @@ var I18N = {
     createGroup: 'Create group', noChoiceGroups: 'No choice groups.',
     noChildren: 'Nothing in this section yet.', noOptions: 'No options yet.',
     review: 'Review order', reviewOrder: 'Review order', keepEditing: 'Keep editing',
+    cancelDraft: 'Cancel order', discardDraftPrompt: 'This will remove the items from this cart.', draftCancelled: 'Order cancelled.',
+    removeDraftItem: 'Remove',
     sendKitchen: 'Send to kitchen', print: 'Print', served: 'Served', cancel: 'Cancel',
     ticket: 'Ticket', noteKitchen: 'Note for the kitchen (allergy, timing...)',
     noteOptional: 'optional', new: 'New', preparing: 'Preparing',
@@ -373,13 +403,22 @@ var I18N = {
     partySize: 'Party size', reservationNote: 'Note', booked: 'Booked', seated: 'Seated',
     noShow: 'No-show', createReservation: 'Add reservation', sales: 'Sales',
     payment: 'Payment', recordPayment: 'Record payment', amount: 'Amount',
+    settleAndPrint: 'Settle & print receipt', paymentRecorded: 'Payment recorded.', receiptPrintFailed: 'Payment recorded, but receipt printing failed: ',
+    tableList: 'Tables', tableHistory: 'Table history', noTableOrders: 'No orders for this table.',
+    balanceDue: 'Balance due', paidLabel: 'Paid', unpaidLabel: 'Unpaid', ordersCount: 'orders',
     method: 'Payment method', cash: 'Cash', card: 'Card', other: 'Other',
     splitItems: 'Split by items', paid: 'Paid', balance: 'Due', requestBill: 'Request bill',
-    analyticsPeriod: 'Period', topItems: 'Top-selling items', revenue: 'Payments received',
+    analyticsPeriod: 'Preset', topItems: 'Top-selling items', revenue: 'Payments received',
+    salesFrom: 'From date', salesTo: 'To date', salesTimeFrom: 'From time', salesTimeTo: 'To time',
+    salesActor: 'Waiter / admin', salesAll: 'Everyone', salesAdmins: 'Admin orders',
+    salesAllWaiters: 'All waiters', applyFilters: 'Apply filters', printReport: 'Print report',
+    paymentCount: 'Payments', transactions: 'Payment details', actorColumn: 'Waiter / admin',
+    dateColumn: 'Date and time', orderColumn: 'Order', amountColumn: 'Amount', methodColumn: 'Method',
+    popupBlocked: 'Allow the print window to open this report.',
     newBranch: 'New branch', copyMenu: 'Copy current menu and staff',
     stock: 'Remaining stock (blank = not tracked)', image: 'Item image', modifiers: 'Options (one per line: name:price)',
     noReservations: 'No upcoming reservations.', branchCreated: 'Branch created',
-    inventory: 'Inventory', noSales: 'No recorded sales for this period.',
+    inventory: 'Inventory', noSales: 'No payments were recorded in this range. Record a payment from Orders to count a sale.',
     refund: 'Refund', refundAmount: 'Refund amount', paymentRefunded: 'Refund recorded',
     pageTitle: 'Restaurant Orders',
     staffPin: 'PIN code (leave blank = no PIN)', staffRole: 'Role', kitchenStation: 'Kitchen station',
@@ -652,9 +691,31 @@ function render() {
   else if (S.role === 'waiter') renderWaiter(app);
   else if (S.role === 'kitchen') renderKitchen(app);
   else if (S.role === 'admin') renderAdmin(app);
+  applyRestaurantBranding(app);
   if (aeId) {
     var el = document.getElementById(aeId);
     if (el) { el.focus(); if (pos != null && el.setSelectionRange) { try { el.setSelectionRange(pos, pos); } catch (e) {} } }
+  }
+}
+function restaurantBrandMarkup(compact) {
+  if (!S.data) return '';
+  var settings = S.data.settings || {};
+  var name = settings.restaurant_name != null ? String(settings.restaurant_name).trim() : String(S.data.restaurant || '').trim();
+  var logo = String((compact ? (settings.restaurant_logo_compact || settings.restaurant_logo) :
+    (settings.restaurant_logo || settings.restaurant_logo_compact)) || '').trim();
+  if (!name && !logo) return '';
+  return '<span class="restaurant-brand">' + (logo ? '<img src="' + esc(logo) + '" alt="">' : '') +
+    (name ? '<span class="restaurant-brand-name">' + esc(name) + '</span>' : '') + '</span>';
+}
+function applyRestaurantBranding(app) {
+  if (!app) return;
+  var left = app.querySelector('.topbar .tb-left');
+  var markup = restaurantBrandMarkup(!!left);
+  if (!markup) return;
+  if (left) left.insertAdjacentHTML('beforeend', markup);
+  else {
+    var home = app.querySelector('.role-wrap');
+    if (home) home.insertAdjacentHTML('afterbegin', '<div class="home-branding">' + restaurantBrandMarkup(false) + '</div>');
   }
 }
 function setRole(r) {
@@ -663,6 +724,7 @@ function setRole(r) {
 }
 function goHome() {
   S.role = null; S.waiterId = null; S.tableNo = null; S.kitchenStation = null; S.kitchenStaffId = null;
+  S.adminTabHistory = [];
   S.adminPin = null;
   sessionStorage.removeItem('ro_waiter'); sessionStorage.removeItem('ro_adminpin');
   if (sseSource) { sseSource.close(); sseSource = null; }
@@ -675,15 +737,12 @@ function renderRoleSelect(app) {
   var name = S.data ? esc(localizedLabel(S.data.restaurant)) : tr('restaurantName');
   app.innerHTML =
     '<div class="role-wrap">' +
-      '<div class="brand">' + name + '</div>' +
       '<div style="margin-bottom:18px">' + branchControl() + langControl() + '</div>' +
-      '<h1>' + tr('whoUses') + '</h1>' +
       '<div class="roles">' +
         '<button class="role" onclick="chooseRole(\'waiter\')"><span class="ricon">🧑‍🍽️</span>' + tr('waiterRole') + '</button>' +
         '<button class="role" onclick="chooseRole(\'kitchen\')"><span class="ricon">👨‍🍳</span>' + tr('kitchenRole') + '</button>' +
         '<button class="role" onclick="chooseRole(\'admin\')"><span class="ricon">⚙️</span>' + tr('adminRole') + '</button>' +
       '</div>' +
-      '<div class="hint">' + tr('roleHint') + ' ' + tr('roleHintMore') + '</div>' +
     '</div>';
 }
 function chooseRole(r) {
@@ -706,11 +765,12 @@ function showStationPicker() {
   var app = $('#app');
   app.innerHTML =
     '<div class="topbar"><div class="tb-left"><span class="tb-title">👨‍🍳 ' + tr('stationPick') + '</span></div>' +
-    '<div class="tb-right"><button class="btn small" onclick="render()">← ' + tr('roles') + '</button></div></div>' +
+    '<div class="tb-right"><button class="btn small" onclick="goHome()">⌂ ' + tr('home') + '</button></div></div>' +
     '<div class="pad"><div class="pick-grid">' +
       '<button class="role" onclick="pickStation(null,false)"><span class="ricon">🌐</span>' + tr('allStations') + '</button>' +
       staffBtns +
     '</div></div>';
+  applyRestaurantBranding(app);
 }
 var stationPinBuf = '';
 function pickKitchenMember(id) {
@@ -786,7 +846,7 @@ function renderWaiterSelect(app) {
   }).join('');
   app.innerHTML =
     '<div class="topbar"><div class="tb-left"><span class="tb-title">' + tr('waiterSignin') + '</span></div>' +
-      '<div class="tb-right">' + branchControl() + langControl() + '<button class="btn small" onclick="S.role=null;saveLS(\'ro_role\',null);render()">← ' + tr('roles') + '</button>' + connDot() + '</div></div>' +
+      '<div class="tb-right">' + branchControl() + langControl() + '<button class="btn small" onclick="goHome()">⌂ ' + tr('home') + '</button>' + connDot() + '</div></div>' +
     '<div class="pad"><div class="pick-grid">' + (btns || '<p class="empty">' + tr('waiterHint') + '</p>') + '</div></div>';
 }
 var staffPinBuf = '';
@@ -836,7 +896,7 @@ function waiterHeader(me, backTo) {
     '<button class="btn small" onclick="switchWaiter()">👤 ' + esc(me.name) + ' ▸ ' + tr('switchWaiter') + '</button>' + connDot();
   var left = backTo
     ? '<button class="btn small" onclick="backToTables()">←</button><span class="tb-title">' + tr('table') + ' ' + S.tableNo + '</span>'
-    : '<span class="tb-title">' + tr('myTables') + '</span><span class="tb-sub">' + esc(localizedLabel(S.data.restaurant)) + '</span>';
+    : '<span class="tb-title">' + tr('myTables') + '</span>';
   return '<div class="topbar"><div class="tb-left">' + left + '</div><div class="tb-right">' + right + '</div></div>';
 }
 function switchWaiter() { S.waiterId = null; sessionStorage.removeItem('ro_waiter'); S.tableNo = null; render(); }

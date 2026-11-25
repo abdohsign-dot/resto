@@ -58,14 +58,14 @@ function catalogLinePrice(line) {
   return cents / 100;
 }
 
-function renderTableScreen(app, me) {
+function renderTableScreen(app, me, isAdminPos) {
   if (S.waiterCatalogLoadedFor !== S.branchId) {
     loadWaiterCatalog().then(function () { render(); }).catch(function (e) {
       toast(e.message || tr('needConnection'));
     });
   }
   var tableNo = S.tableNo;
-  var orders = (S.data.orders || []).filter(function (o) { return o.table_no === tableNo; });
+  var orders = isAdminPos ? [] : (S.data.orders || []).filter(function (o) { return o.table_no === tableNo; });
   var open = openOrders(orders);
   var recent = orders.filter(function (o) { return openOrders([o]).length === 0; }).slice(0, 3);
 
@@ -175,20 +175,35 @@ function renderTableScreen(app, me) {
   var cnt = cartCount(tableNo), tot = cartTotal(tableNo);
   var cartbar = cnt
     ? '<div class="cartbar"><span>🛒 ' + cnt + ' ' + tr(cnt === 1 ? 'itemSingular' : 'itemsPlural') + ' · ' + money(tot) +
-      '</span><button onclick="openReview()">' + tr('review') + ' ▸</button></div>'
+      '</span><div class="cartbar-actions"><button class="cart-cancel" onclick="cancelOrderDraft()">' + tr('cancelDraft') + '</button>' +
+      '<button onclick="openReview()">' + tr('review') + ' ▸</button></div></div>'
     : '';
 
-  app.innerHTML = waiterHeader(me, true) +
-    '<div class="twocol">' +
-      '<div class="panel"><h3>' + tr('tickets') + '</h3>' + tickets + history + '</div>' +
+  var targetPicker = isAdminPos ? '<div class="pos-target"><button class="btn ' + (S.adminOrderType === 'dine_in' ? 'on' : '') + '" onclick="setAdminOrderType(\'dine_in\')">🪑 Dine-in</button><button class="btn ' + (S.adminOrderType === 'imported' ? 'on' : '') + '" onclick="setAdminOrderType(\'imported\')">📦 Imported Order</button>' +
+    (S.adminOrderType === 'dine_in' ? '<label>Table <input class="in pos-table" type="number" min="1" value="' + esc(S.adminDineInTable) + '" onchange="setAdminDineInTable(this.value)"></label>' : '') + '</div>' : '';
+  var page = (isAdminPos ? '<div class="topbar"><div class="tb-left"><span class="tb-title">' + (S.adminOrderType === 'imported' ? '📦 Imported Order' : '🪑 Table ' + tableNo) + '</span></div></div>' : waiterHeader(me, true)) +
+    '<div class="twocol' + (isAdminPos ? ' admin-pos' : '') + '">' +
+      (isAdminPos ? '' : '<div class="panel"><h3>' + tr('tickets') + '</h3>' + tickets + history + '</div>') +
       '<div><div class="panel">' +
         '<h3>' + tr('menu') + '</h3>' +
+        targetPicker +
         '<div class="searchrow"><input id="f-wsearch" class="in" placeholder="' + tr('searchMenu') + '" ' +
           'value="' + esc(S.search) + '" oninput="setSearch(this.value)"></div>' +
         '<div class="menu-breadcrumb">' + crumbs + '</div>' +
         '<div class="menu-grid">' + (grid || '<div class="empty">' + tr('noDishes') + '</div>') + '</div>' +
       '</div></div>' +
     '</div>' + cartbar;
+  if (app) app.innerHTML = page;
+  return page;
+}
+function setAdminOrderType(type) {
+  S.adminOrderType = type === 'dine_in' ? 'dine_in' : 'imported';
+  S.tableNo = S.adminOrderType === 'imported' ? 0 : Math.max(1, parseInt(S.adminDineInTable, 10) || 1);
+  S.sectionFilter = 0; S.menuPath = []; render();
+}
+function setAdminDineInTable(value) {
+  S.adminDineInTable = Math.max(1, parseInt(value, 10) || 1);
+  S.tableNo = S.adminDineInTable; render();
 }
 function setSearch(v) { S.search = v; render(); }
 function setSectionFilter(id) { S.sectionFilter = id; S.menuPath = []; render(); }
@@ -363,18 +378,16 @@ function ticketCard(o, actions) {
       (l.variant_name ? ' <span class="lnote">(' + esc(l.variant_name) + ')</span>' : '') +
       (modifiers.length ? '<span class="lnote"> · ' + esc(modifierNames) + '</span>' : '') +
       (l.note ? ' <span class="lnote">— ' + esc(l.note) + '</span>' : '') + '</span>' +
-      '<span class="dim">' + (l.status === 'cancelled' ? tr('cancelled') : money(l.price * l.qty)) + '</span></div>';
+      '<span class="tline-meta"><span class="chip ' + l.status + ' tline-state">' + tStatus(l.status) + '</span>' +
+      (l.status === 'cancelled' ? '' : '<span class="dim">' + money(l.price * l.qty) + '</span>') + '</span></div>';
   }).join('');
-  var acts = '<div class="tacts"><button class="btn small" onclick="printTicket(' + o.id + ')">🖨️ ' +
-    tr('print') + '</button>';
+  var acts = '';
   if (actions) {
-    acts +=
-      (!o.bill_requested && o.status !== 'cancelled'
-        ? '<button class="btn small" onclick="requestBill(' + o.id + ')">' + tr('requestBill') + '</button>' : '') +
+    acts = '<div class="tacts">' +
       (o.status === 'ready' ? '<button class="btn small green" onclick="serveOrder(' + o.id + ')">✓ ' + tr('served') + '</button>' : '') +
       '<button class="btn small danger" onclick="cancelOrderDlg(' + o.id + ')">✕ ' + tr('cancel') + '</button>';
+    acts += '</div>';
   }
-  acts += '</div>';
   return '<div class="ticket st-' + o.status + '">' +
     '<div class="thead"><span class="tid">' + tr('ticket') + ' #' + o.id + ' · ' + hhmm(o.created_at) + '</span>' +
     '<span class="chip ' + o.status + '">' + tStatus(o.status) + '</span></div>' +
@@ -383,11 +396,6 @@ function ticketCard(o, actions) {
     '<div class="thead"><span class="bigprice">' + money(o.total) + '</span></div>' +
     acts + '</div>';
 }
-async function requestBill(id) {
-  try { await api('/api/orders/' + id + '/bill', 'PUT', {}); poll(); }
-  catch (e) { toast(e.code ? e.message : tr('needConnection')); }
-}
-
 // ---------- review + send ----------
 function openReview() {
   var t = S.tableNo, cart = cartFor(t);
@@ -415,15 +423,34 @@ function openReview() {
       '<b>' + l.qty + '</b>' +
       '<button class="btn small" onclick="cartQty(' + idx + ',1)">＋</button>' +
       '<button class="btn small" onclick="cartNote(' + idx + ')">✎ ' + tr('noteLabel') + '</button>' +
+      '<button class="btn small danger" aria-label="' + tr('removeDraftItem') + '" title="' + tr('removeDraftItem') + '" onclick="removeDraftLine(' + idx + ')">× ' + tr('removeDraftItem') + '</button>' +
       '</div>';
   }).join('');
-  dlg('<h2>' + tr('table') + ' ' + t + ' — ' + tr('reviewOrder') + '</h2>' +
+  dlg('<h2>' + (S.role === 'admin' ? (S.adminOrderType === 'imported' ? '📦 Imported Order' : '🪑 Table ' + t) : tr('table') + ' ' + t) + ' — ' + tr('reviewOrder') + '</h2>' +
     '<div class="rows">' + rows + '</div>' +
     '<label class="f">' + tr('noteKitchen') + '</label>' +
     '<textarea id="f-onote" class="in" rows="2" placeholder="' + tr('optional') + '"></textarea>' +
     '<div class="dlg-foot">' +
+    '<button class="btn danger" onclick="cancelOrderDraft()">' + tr('cancelDraft') + '</button>' +
     '<button class="btn" onclick="closeDlg()">' + tr('keepEditing') + '</button>' +
     '<button class="btn primary" onclick="sendOrder()">' + tr('send') + ' ▸</button></div>');
+}
+function cancelOrderDraft() {
+  dlg('<h2>' + tr('cancelDraft') + '?</h2><p>' + tr('discardDraftPrompt') + '</p>' +
+    '<div class="dlg-foot"><button class="btn" onclick="closeDlg()">' + tr('keepEditing') + '</button>' +
+    '<button class="btn danger" onclick="confirmCancelOrderDraft()">' + tr('cancelDraft') + '</button></div>');
+}
+function confirmCancelOrderDraft() {
+  S.cart[S.tableNo] = [];
+  cartSave(); closeDlg(); render(); toast(tr('draftCancelled'));
+}
+function removeDraftLine(idx) {
+  var cart = cartFor(S.tableNo);
+  if (idx < 0 || idx >= cart.length) return;
+  cart.splice(idx, 1);
+  cartSave(); closeDlg();
+  if (cart.length) openReview();
+  render();
 }
 function cartQty(idx, d) {
   var cart = cartFor(S.tableNo);
@@ -450,7 +477,9 @@ async function sendOrder() {
   var note = noteEl ? noteEl.value.trim().slice(0, 300) : '';
   if (!cart.length) return;
   var body = {
-    table_no: t, staff_id: S.waiterId, note: note, client_uuid: uuid(), lang: S.lang,
+    table_no: t, staff_id: S.role === 'admin' ? null : S.waiterId,
+    order_type: S.role === 'admin' && S.adminOrderType === 'imported' ? 'imported' : 'dine_in',
+    note: note, client_uuid: uuid(), lang: S.lang,
     lines: cart.map(function (l) {
       return {
         product_id: l.product_id,
