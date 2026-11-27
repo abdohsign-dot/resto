@@ -45,8 +45,12 @@ APP_PATH = os.path.join(BASE, "app.html")
 
 DEFAULT_CONFIG = {
     "restaurant_name": "Restaurant",
+    "restaurant_phone": "",
+    "restaurant_address": "",
     "restaurant_logo": "",
     "restaurant_logo_compact": "",
+    "ticket_footer": "",
+    "ticket_footer_font_size": "normal",
     "currency": "MAD",
     "admin_pin": "1234",
     "printer_ip": "",
@@ -355,6 +359,9 @@ def init_db():
             if column not in existing:
                 conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, definition))
     conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_branch_created ON orders(branch_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_branch_table_created ON orders(branch_id, table_no, created_at DESC, id DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_order_created ON payments(order_id, created_at, id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reservations_branch_time ON reservations(branch_id, starts_at)")
     conn.execute("UPDATE sections SET kitchen_station=name WHERE kitchen_station IS NULL OR kitchen_station=''")
     row = conn.execute("SELECT value FROM meta WHERE key='rev'").fetchone()
@@ -749,16 +756,55 @@ def ticket_text(order, lang="fr"):
         out.append("*** %s ***" % labels["order_cancelled"].center(TICKET_W - 8))
         if order.get("cancel_reason"):
             out.append(labels["reason"] + ": " + order["cancel_reason"])
+    contact_lines = []
+    for detail in (cfg.get("restaurant_phone"), cfg.get("restaurant_address")):
+        detail = str(detail or "").replace("\r", "").strip()
+        for raw_line in detail.split("\n"):
+            while raw_line:
+                contact_lines.append(raw_line[:TICKET_W])
+                raw_line = raw_line[TICKET_W:]
+    message_lines = []
+    detail = str(cfg.get("ticket_footer") or "").replace("\r", "").strip()
+    for raw_line in detail.split("\n"):
+        while raw_line:
+            message_lines.append(raw_line[:TICKET_W])
+            raw_line = raw_line[TICKET_W:]
+    if contact_lines or message_lines:
+        out.append("\x1f")
+        out.append(sep)
+        out.extend(contact_lines)
+        if message_lines:
+            out.append("\x1e")
+            out.extend(message_lines)
     return "\n".join(out)
 
 def escpos_bytes(text):
     b = b"\x1b@"                      # init
     b += b"\x1ba\x01"                 # center
-    b += escpos_logo_bytes()
-    header, rest = text.split("\n", 1)
-    b += header.encode("cp437", errors="replace") + b"\n"
+    main, footer = text.split("\n\x1f\n", 1) if "\n\x1f\n" in text else (text, "")
+    header, rest = main.split("\n", 1)
+    logo = escpos_logo_bytes()
+    layout = CONFIG.get("ticket_header_layout", "logo_name")
+    if layout == "logo_only":
+        b += logo
+    elif layout == "name_only":
+        b += header.encode("cp437", errors="replace") + b"\n"
+    elif layout == "name_logo":
+        b += header.encode("cp437", errors="replace") + b"\n" + logo
+    else:
+        # Side-by-side is shown in browser print; thermal printers stack the logo.
+        b += logo + header.encode("cp437", errors="replace") + b"\n"
     b += b"\x1ba\x00"                 # left
-    b += rest.encode("cp437", errors="replace") + b"\n\n\n"
+    b += rest.encode("cp437", errors="replace")
+    if footer:
+        footer = footer.replace("\x1f\n", "", 1)
+        contact, has_message, message = footer.partition("\n\x1e\n")
+        b += b"\x1ba\x01" + contact.encode("cp437", errors="replace")
+        if has_message:
+            size = CONFIG.get("ticket_footer_font_size", "normal")
+            b += {"small": b"\x1bM\x01", "normal": b"\x1bM\x00", "large": b"\x1d!\x10"}.get(size, b"\x1bM\x00")
+            b += message.encode("cp437", errors="replace")
+    b += b"\n\n\n\x1d!\x00\x1bM\x00\x1ba\x00"
     b += b"\x1dV\x01"                 # full cut
     return b
 
@@ -960,8 +1006,17 @@ def maybe_autoprint(order_id):
 TICKET_HTML = """<!doctype html><html lang="%(lang)s" dir="%(dir)s"><head><meta charset="utf-8">
 <title>%(ticket)s #%(id)d</title><style>
 @page { size: 80mm auto; margin: 3mm; }
-body { font: 12px/1.35 "Courier New", monospace; white-space: pre; margin: 0; direction: %(dir)s; text-align: %(align)s; }
-.logo { display: block; max-width: 50mm; max-height: 25mm; object-fit: contain; margin: 0 auto 3mm; }
+body { font: 12px/1.25 "Courier New", monospace; white-space:normal; margin:0; direction:%(dir)s; text-align:%(align)s; }
+.ticket-wrap { width:74mm; max-width:100%%; margin:0 auto; }
+.ticket-main, .ticket-footer { white-space:pre; }
+.logo { display:block; max-width:28mm; max-height:12mm; object-fit:contain; margin:0 auto 1mm; }
+.ticket-brand { text-align:center; margin:0 0 1mm; line-height:1.15; }
+.ticket-brand.horizontal { display:flex; align-items:center; justify-content:center; gap:2mm; }
+.ticket-brand.horizontal .logo { max-width:17mm; max-height:10mm; margin:0; }
+.ticket-title { display:block; }
+.ticket-title strong { font-weight:bold; }
+.ticket-footer { text-align:center; white-space:pre-wrap; }
+.ticket-message { font-size:%(footer_font_size)spx; white-space:pre-wrap; text-align:center; }
 @media print { .noprint { display: none } }
 .noprint { padding: 8px; text-align: center; }
 .noprint button { font-size: 16px; padding: 10px 22px; }
@@ -978,15 +1033,40 @@ def ticket_html(order_id, lang="en"):
         order = get_order(conn, order_id)
     finally:
         conn.close()
-    text = ticket_text(order, lang).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    raw_text = ticket_text(order, lang)
+    main, footer = raw_text.split("\n\x1f\n", 1) if "\n\x1f\n" in raw_text else (raw_text, "")
+    title, _sep, main_rest = main.partition("\n")
+    text = main_rest.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    footer = footer.replace("\x1f\n", "", 1)
+    footer_contact, _message_sep, footer_message = footer.partition("\n\x1e\n")
+    footer_contact = footer_contact.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    footer_message = footer_message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     labels = {"fr": ("Imprimer le ticket", "right"), "ar": ("طباعة التذكرة", "right"),
               "en": ("Print ticket", "left")}
     print_label, align = labels[lang]
     logo_url = str(CONFIG.get("restaurant_logo_compact") or CONFIG.get("restaurant_logo") or "")
     logo = '<img class="logo" src="%s" alt="">' % logo_url if re.fullmatch(
         r"/item-images/[a-fA-F0-9]{32}\.(?:png|jpg|webp)", logo_url) else ""
+    layout = CONFIG.get("ticket_header_layout", "logo_name")
+    safe_title = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    title_html = '<span class="ticket-title"><strong>%s</strong></span>' % safe_title
+    if layout == "logo_only":
+        brand = '<div class="ticket-brand">' + logo + '</div>' if logo else ""
+    elif layout == "name_only":
+        brand = '<div class="ticket-brand"><span class="ticket-title">%s</span></div>' % safe_title
+    elif layout == "name_logo":
+        brand = '<div class="ticket-brand">' + title_html + logo + '</div>'
+    elif layout == "horizontal":
+        brand = '<div class="ticket-brand horizontal">' + logo + title_html + '</div>'
+    else:
+        brand = '<div class="ticket-brand">' + logo + title_html + '</div>'
+    footer_html = ('<div class="ticket-footer">%s</div>' % footer_contact if footer_contact.strip() else "")
+    if footer_message.strip():
+        footer_html += '<div class="ticket-message">%s</div>' % footer_message
     return TICKET_HTML % {
-        "id": order_id, "body": logo + "<div>%s</div>" % text, "lang": lang,
+        "id": order_id, "body": '<div class="ticket-wrap">' + brand + '<div class="ticket-main">%s</div>' % text + footer_html + '</div>', "lang": lang,
+        "footer_font_size": {"small": 10, "normal": 12, "large": 14}.get(CONFIG.get("ticket_footer_font_size"), 12),
+        "font_size": {"small": 10, "normal": 12, "large": 14}.get(CONFIG.get("ticket_font_size"), 12),
         "dir": "rtl" if lang == "ar" else "ltr", "align": align,
         "ticket": {"fr": "Ticket", "ar": "تذكرة", "en": "Ticket"}[lang],
         "print_label": print_label,
@@ -1004,6 +1084,13 @@ def h_ticket(args, body, conn):
 def h_state(args, body, conn):
     branch_id = get_branch_id(body)
     require_branch(conn, branch_id)
+    current_rev = get_rev(conn)
+    try:
+        since_rev = int(body.get("since_rev", -1))
+    except (TypeError, ValueError):
+        since_rev = -1
+    if since_rev >= 0 and since_rev == current_rev:
+        return {"ok": True, "unchanged": True, "rev": current_rev}
     cutoff = time.time() - 86400
 
     # Build a quick lookup: item_id -> kitchen_station (via sections join)
@@ -1067,14 +1154,14 @@ def h_state(args, body, conn):
 
     return {
         "branch_id": branch_id,
-        "rev": get_rev(conn),
+        "rev": current_rev,
         "catalog_rev": get_catalog_rev(conn),
         "now": time.time(),
         "restaurant": CONFIG.get("restaurant_name", ""),
         "currency": CONFIG["currency"],
         "has_printer": any_printer_configured(),
         "settings": {k: CONFIG.get(k) for k in
-                     ("restaurant_name", "restaurant_logo", "restaurant_logo_compact", "theme", "currency", "printer_ip", "printer_port", "printers", "autoprint",
+                     ("restaurant_name", "restaurant_phone", "restaurant_address", "restaurant_logo", "restaurant_logo_compact", "ticket_footer", "ticket_footer_font_size", "ticket_header_layout", "theme", "currency", "printer_ip", "printer_port", "printers", "autoprint",
                       "disk_warning_mb", "log_retention_days",
                       "ticket_amber_minutes", "ticket_red_minutes")},
         "branches": [dict(r) for r in conn.execute(
@@ -3277,11 +3364,23 @@ def h_settings(args, body, conn):
         CONFIG["restaurant_logo"] = save_uploaded_catalog_image(body["restaurant_logo_upload"])
     if "restaurant_logo_compact_upload" in body:
         CONFIG["restaurant_logo_compact"] = save_uploaded_catalog_image(body["restaurant_logo_compact_upload"])
-    allowed = ("restaurant_name", "restaurant_logo", "restaurant_logo_compact", "theme", "currency", "printer_ip", "printer_port", "printers", "autoprint", "admin_pin", "port",
+    allowed = ("restaurant_name", "restaurant_phone", "restaurant_address", "restaurant_logo", "restaurant_logo_compact", "ticket_footer", "ticket_footer_font_size", "ticket_header_layout", "theme", "currency", "printer_ip", "printer_port", "printers", "autoprint", "admin_pin", "port",
                "disk_warning_mb", "log_retention_days", "ticket_amber_minutes", "ticket_red_minutes")
     for k in allowed:
         if k in body:
             v = body[k]
+            if k == "ticket_footer":
+                v = str(v or "").replace("\r", "")[:500]
+            if k in ("restaurant_phone", "restaurant_address"):
+                v = str(v or "").strip()[:160]
+            if k == "ticket_footer_font_size":
+                v = str(v or "normal")
+                if v not in ("small", "normal", "large"):
+                    raise ApiError(400, "Invalid ticket font size")
+            if k == "ticket_header_layout":
+                v = str(v or "logo_name")
+                if v not in ("logo_only", "name_only", "logo_name", "name_logo", "horizontal"):
+                    raise ApiError(400, "Invalid ticket header layout")
             if k == "theme":
                 v = str(v or "warm")
                 if v not in ("warm", "cool", "neutral"):
@@ -3351,6 +3450,42 @@ def h_order_history(args, body, conn):
         orders.append(order)
     return {"ok": True, "table_no": table_no, "orders": orders}
 
+def h_audit_log(args, body, conn):
+    try:
+        limit = max(1, min(200, int(body.get("limit") or 100)))
+    except (TypeError, ValueError):
+        limit = 100
+    if not os.path.isdir(AUDIT_DIR):
+        return {"ok": True, "entries": []}
+    files = []
+    for name in os.listdir(AUDIT_DIR):
+        if not re.fullmatch(r"\d{2}-\d{2}-\d{4}\.jsonl", name):
+            continue
+        path = os.path.join(AUDIT_DIR, name)
+        try:
+            files.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    entries = []
+    for _mtime, path in sorted(files, reverse=True):
+        try:
+            with open(path, "r", encoding="utf-8") as log:
+                for line in reversed(log.readlines()):
+                    try:
+                        row = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    entries.append({key: row.get(key) for key in (
+                        "event_id", "date", "timestamp", "timezone", "operation", "path",
+                        "status", "result", "actor", "claimed_role", "claimed_actor_id",
+                        "branch_id", "resource_ids", "change_summary")})
+                    if len(entries) >= limit:
+                        return {"ok": True, "entries": entries}
+        except OSError:
+            continue
+    return {"ok": True, "entries": entries}
+
+
 def h_export(args, body, conn):
     data = h_state(args, body, conn)
     branch_id = data["branch_id"]
@@ -3388,6 +3523,7 @@ ROUTES = [
     ("POST",   r"^/api/print/(\d+)$",               h_print,          True),
     ("GET",    r"^/api/orders/history$",             h_order_history,  True),
     ("GET",    r"^/api/export$",                    h_export,         True),
+    ("GET",    r"^/api/admin/activity$",            h_audit_log,      True),
     ("POST",   r"^/api/sections$",                  h_section_create, True),
     ("PUT",    r"^/api/sections/(\d+)$",            h_section_update, True),
     ("PATCH",  r"^/api/sections/(\d+)$",            h_section_update, True),
@@ -3674,7 +3810,9 @@ class Handler(BaseHTTPRequestHandler):
                               "time_from": (query or {}).get("time_from", ["00:00"])[0],
                               "time_to": (query or {}).get("time_to", ["23:59"])[0],
                               "actor": (query or {}).get("actor", ["all"])[0],
-                              "table_no": (query or {}).get("table_no", [None])[0]})
+                              "table_no": (query or {}).get("table_no", [None])[0],
+                              "since_rev": (query or {}).get("since_rev", [None])[0],
+                              "limit": (query or {}).get("limit", [100])[0]})
                 body["branch_id"] = self.headers.get("X-Branch-ID") or (
                     (query or {}).get("branch_id", [body.get("branch_id", 1)])[0])
                 # Audit field names and low-risk allowlisted values only.

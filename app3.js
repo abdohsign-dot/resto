@@ -1190,7 +1190,7 @@ function reservationDlg() {
   dlg('<h2>' + tr('newReservation') + '</h2>' +
     '<label class="f">' + tr('guestName') + '</label><input id="f-r-name" class="in">' +
     '<label class="f">' + tr('contact') + '</label><input id="f-r-contact" class="in">' +
-    '<label class="f">' + tr('reservationTime') + '</label><input id="f-r-time" class="in" type="datetime-local" value="' + date.toISOString().slice(0,16) + '">' +
+    '<label class="f">' + tr('reservationTime') + '</label><input id="f-r-time" class="in" lang="fr" type="datetime-local" value="' + date.toISOString().slice(0,16) + '">' +
     '<label class="f">' + tr('partySize') + '</label><input id="f-r-size" class="in" type="number" min="1" max="50" value="2">' +
     '<label class="f">' + tr('table') + '</label><input id="f-r-table" class="in" type="number" min="1">' +
     '<label class="f">' + tr('reservationNote') + '</label><input id="f-r-note" class="in">' +
@@ -1263,6 +1263,8 @@ async function loadSales(period) {
   }
   S.salesTimeFrom = val('sales-time-from') || S.salesTimeFrom || '00:00';
   S.salesTimeTo = val('sales-time-to') || S.salesTimeTo || '23:59';
+  var time24 = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+  if (!time24.test(S.salesTimeFrom) || !time24.test(S.salesTimeTo)) { toast('Enter time in 24-hour HH:MM format (00:00–23:59)'); return; }
   S.salesActor = val('sales-actor') || S.salesActor || 'all';
   var query = [
     ['period', 'custom'], ['date_from', S.salesDateFrom], ['date_to', S.salesDateTo],
@@ -1316,8 +1318,8 @@ function adminAnalytics() {
     '</select></label>' +
     '<label>' + tr('salesFrom') + '<input id="sales-date-from" class="in" type="date" value="' + esc(S.salesDateFrom) + '"></label>' +
     '<label>' + tr('salesTo') + '<input id="sales-date-to" class="in" type="date" value="' + esc(S.salesDateTo) + '"></label>' +
-    '<label>' + tr('salesTimeFrom') + '<input id="sales-time-from" class="in" type="time" value="' + esc(S.salesTimeFrom || '00:00') + '"></label>' +
-    '<label>' + tr('salesTimeTo') + '<input id="sales-time-to" class="in" type="time" value="' + esc(S.salesTimeTo || '23:59') + '"></label>' +
+    '<label>' + tr('salesTimeFrom') + '<input id="sales-time-from" class="in" type="text" inputmode="numeric" maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" aria-label="' + tr('salesTimeFrom') + ' (24-hour HH:MM)" value="' + esc(S.salesTimeFrom || '00:00') + '"></label>' +
+    '<label>' + tr('salesTimeTo') + '<input id="sales-time-to" class="in" type="text" inputmode="numeric" maxlength="5" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" aria-label="' + tr('salesTimeTo') + ' (24-hour HH:MM)" value="' + esc(S.salesTimeTo || '23:59') + '"></label>' +
     '<label>' + tr('salesActor') + '<select id="sales-actor" class="in">' + salesActorOptions() + '</select></label>' +
     '<button class="btn primary" onclick="loadSales(\'custom\')">' + tr('applyFilters') + '</button>' +
     '<button class="btn" onclick="printSalesReport()">🖨️ ' + tr('printReport') + '</button>' +
@@ -1448,9 +1450,10 @@ function adminTableHistoryBody() {
       return '<div class="row"><span class="grow">' + hhmm(p.created_at) + ' · ' + tr(p.method) +
         '</span><b>' + money(p.amount - p.refunded_amount) + '</b></div>';
     }).join('');
-    var actions = o.balance > 0.005 && o.status !== 'cancelled'
-      ? '<button class="btn small primary" onclick="paymentDlg(' + o.id + ',' + Number(o.balance) + ')">' + tr('settleAndPrint') + '</button>'
-      : (o.paid > 0 ? '<button class="btn small" onclick="printAdminReceipt(' + o.id + ')">🧾 ' + tr('print') + '</button>' : '');
+    var actions = '<button class="btn small" onclick="printTicket(' + o.id + ')">👁 Preview ticket</button>' +
+      (o.balance > 0.005 && o.status !== 'cancelled'
+        ? '<button class="btn small primary" onclick="paymentDlg(' + o.id + ',' + Number(o.balance) + ')">' + tr('settleAndPrint') + '</button>'
+        : (o.paid > 0 ? '<button class="btn small" onclick="printAdminReceipt(' + o.id + ')">🧾 ' + tr('print') + '</button>' : ''));
     return '<article class="table-history-order"><div class="thead"><b>' + tr('ticket') + ' #' + o.id +
       ' · ' + hhmm(o.created_at) + '</b><span class="chip ' + o.status + '">' + tStatus(o.status) + '</span></div>' +
       '<div class="dim">' + esc(o.order_type === 'imported' ? 'Imported' : (o.staff_name || 'Admin')) + '</div>' +
@@ -1540,6 +1543,19 @@ function adminSettings() {
     (st.restaurant_logo_compact ? '<div class="settings-logo-preview"><img src="' + esc(st.restaurant_logo_compact) + '" alt="Compact logo"><button class="btn small danger" onclick="removeRestaurantLogo(\'compact\')">Remove compact logo</button></div>' : '') +
     '<label class="f">Compact logo for app and tickets</label><input id="f-s-logo-compact" class="in" type="file" accept="image/png,image/jpeg,image/webp">' +
     '<label class="f">' + tr('currency') + '</label><input id="f-s-cur" class="in" value="' + esc(st.currency || 'MAD') + '" maxlength="4">' +
+    '<section class="ticket-settings"><h3>Ticket</h3>' +
+    '<p class="dim">Configure the receipt header and footer. Order items, prices, and totals keep their standard layout and size.</p>' +
+    '<h4>Header</h4>' +
+    '<label class="f">Logo and restaurant name</label><select id="f-s-ticket-layout" class="in">' +
+      [['logo_only','Logo only'],['name_only','Restaurant name only'],['logo_name','Logo above name'],['name_logo','Name above logo'],['horizontal','Logo and name side by side']].map(function (x) { return '<option value="' + x[0] + '"' + ((st.ticket_header_layout || 'logo_name') === x[0] ? ' selected' : '') + '>' + x[1] + '</option>'; }).join('') + '</select>' +
+    '<h4>Footer</h4>' +
+    '<label class="f">Restaurant phone</label><input id="f-s-phone" class="in" value="' + esc(st.restaurant_phone || '') + '" maxlength="160">' +
+    '<label class="f">Restaurant address</label><input id="f-s-address" class="in" value="' + esc(st.restaurant_address || '') + '" maxlength="160">' +
+    '<label class="f">Extra sentence (promotion, thank-you, etc.)</label><textarea id="f-s-ticket-footer" class="in" rows="3" maxlength="500" placeholder="Example: Next Friday: 20% off">' + esc(st.ticket_footer || '') + '</textarea>' +
+    '<label class="f">Promotion / thank-you message size</label><select id="f-s-ticket-font" class="in">' +
+      [['small','Small — compact'],['normal','Standard'],['large','Large']].map(function (x) { return '<option value="' + x[0] + '"' + ((st.ticket_footer_font_size || 'normal') === x[0] ? ' selected' : '') + '>' + x[1] + '</option>'; }).join('') + '</select>' +
+    '<p class="dim">Only the extra sentence changes size. Phone and address stay standard size and are centered; order items and totals are unchanged.</p>' +
+    '<button class="btn primary" type="button" onclick="saveTicketSettings()">Save ticket settings</button></section>' +
     '<h3 style="margin-top:26px">Kitchen and receipt printers</h3>' +
     '<p class="dim">Route each kitchen station to its own printer. Stations without an address use the default kitchen printer. The admin printer receives the full priced receipt.</p>' +
     '<label class="f">Default kitchen printer IP</label><input id="f-s-ip" class="in" value="' + esc(defaultPrinter.ip || '') + '" placeholder="' + tr('printerIpPlaceholder') + '">' +
@@ -1549,11 +1565,37 @@ function adminSettings() {
     '<h4>Station printers</h4>' + (stationRows || '<p class="dim">No kitchen sections are configured.</p>') +
     '<p class="dim printer-auto-note">Kitchen tickets print automatically when an order is sent. Configure a printer for each kitchen section above.</p>' +
     '<div class="dlg-foot" style="justify-content:flex-start"><button class="btn primary" onclick="saveSettings()">' + tr('saveSettings') + '</button></div>' +
+    '<h3 style="margin-top:26px">Activity log</h3>' +
+    '<p class="dim">Recent changes and requests, with event IDs for reference.</p>' +
+    '<button class="btn" onclick="loadActivityLog()">View recent activity</button>' +
     '<h3 style="margin-top:26px">' + tr('security') + '</h3>' +
     '<label class="f">' + tr('newAdminPin') + '</label>' +
     '<div class="searchrow"><input id="f-s-pin" class="in" type="password" inputmode="numeric" placeholder="' + tr('newPinPlaceholder') + '">' +
     '<button class="btn" style="flex:0 0 auto" onclick="changePin()">' + tr('changePin') + '</button></div>' +
     '</div>';
+}
+async function loadActivityLog() {
+  try {
+    var result = await api('/api/admin/activity?limit=100');
+    var entries = result.entries || [];
+    var content = entries.map(function (entry) {
+      var staff = (S.data.staff || []).filter(function (person) { return String(person.id) === String(entry.claimed_actor_id); })[0];
+      var who = entry.actor === 'admin' ? 'Admin' : (staff ? staff.name : (entry.claimed_role || entry.actor || 'Unknown'));
+      if (entry.claimed_actor_id && !staff && entry.actor !== 'admin') who += ' #' + entry.claimed_actor_id;
+      var summary = entry.change_summary || {};
+      var resource = entry.resource_ids || {};
+      var details = Object.keys(summary).map(function (key) { return key + ': ' + summary[key]; });
+      Object.keys(resource).forEach(function (key) { details.push(key.replace(/_id$/, '') + ' #' + resource[key]); });
+      var id = String(entry.event_id || '').slice(0, 8).toUpperCase();
+      return '<article class="audit-entry"><div class="audit-head"><b>' + esc(who) + '</b><span class="tag ' + (entry.result === 'failure' ? 'off' : 'on') + '">' + esc(entry.result || '') + ' · ' + esc(entry.status || '') + '</span></div>' +
+        '<div><b>' + esc(entry.operation || '') + '</b> ' + esc(entry.path || '') + '</div>' +
+        (details.length ? '<div class="dim">' + esc(details.join(' · ')) + '</div>' : '') +
+        '<div class="audit-meta">' + esc(entry.timestamp || entry.date || '') + ' · ID ' + esc(id) + '</div></article>';
+    }).join('');
+    dlg('<h2>Recent activity</h2><p class="dim">Actor details come from the signed-in device; shared admin actions are shown as Admin.</p>' +
+      '<div class="audit-list">' + (content || '<div class="empty">No activity recorded yet.</div>') + '</div>' +
+      '<div class="dlg-foot"><button class="btn" onclick="closeDlg()">' + tr('close') + '</button></div>');
+  } catch (e) { toast(e.code ? e.message : tr('needConnection')); }
 }
 async function selectTemplate(theme, button) {
   var select = document.getElementById('f-s-theme');
@@ -1568,10 +1610,24 @@ async function selectTemplate(theme, button) {
     toast(e.code ? e.message : tr('needConnection'));
   }
 }
+async function saveTicketSettings() {
+  var settings = {
+    restaurant_phone: val('f-s-phone'),
+    restaurant_address: val('f-s-address'),
+    ticket_footer: val('f-s-ticket-footer'),
+    ticket_footer_font_size: val('f-s-ticket-font') || 'normal',
+    ticket_header_layout: val('f-s-ticket-layout') || 'logo_name'
+  };
+  try {
+    await api('/api/settings', 'PUT', settings);
+    if (S.data && S.data.settings) Object.keys(settings).forEach(function (key) { S.data.settings[key] = settings[key]; });
+    toast('Ticket settings saved');
+    poll();
+  } catch (e) { toast(e.code ? e.message : tr('needConnection')); }
+}
 async function saveSettings() {
   var defaultIp = val('f-s-ip'), defaultPort = parseInt(val('f-s-port') || '9100', 10) || 9100;
   var adminIp = val('f-s-admin-ip');
-  if (!adminIp) { toast('Admin receipt printer IP is required'); return; }
   var stations = {}, stationIndex = 0;
   Object.keys((function () { var names = {}; (S.data.sections || []).forEach(function (section) { var name = (section.kitchen_station || section.name || '').trim(); if (name) names[name] = true; }); return names; })()).sort().forEach(function (name) {
     var ip = val('f-s-station-ip-' + stationIndex), port = parseInt(val('f-s-station-port-' + stationIndex) || '9100', 10) || 9100;
@@ -1580,17 +1636,26 @@ async function saveSettings() {
   });
   var body = {
     restaurant_name: val('f-s-name'),
+    restaurant_phone: val('f-s-phone'),
+    restaurant_address: val('f-s-address'),
+    ticket_footer_font_size: val('f-s-ticket-font') || 'normal',
+    ticket_header_layout: val('f-s-ticket-layout') || 'logo_name',
     theme: val('f-s-theme'),
     currency: val('f-s-cur') || 'MAD',
-    printer_ip: defaultIp,
-    printer_port: defaultPort,
-    printers: {
+    ticket_footer: val('f-s-ticket-footer')
+  };
+  // Save restaurant and receipt settings even when no admin printer is configured.
+  // Include printer routes only when the required admin printer address is present.
+  if (adminIp) {
+    body.printer_ip = defaultIp;
+    body.printer_port = defaultPort;
+    body.printers = {
       default: { ip: defaultIp, port: defaultPort },
       admin: { ip: adminIp, port: parseInt(val('f-s-admin-port') || '9100', 10) || 9100 },
       stations: stations
-    },
-    autoprint: true
-  };
+    };
+    body.autoprint = true;
+  }
   var logoFile = document.getElementById('f-s-logo').files[0];
   var compactLogoFile = document.getElementById('f-s-logo-compact').files[0];
   async function encodeLogo(file) {

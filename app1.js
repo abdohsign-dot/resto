@@ -588,10 +588,18 @@ async function flushQueue() {
 // ---------- polling ----------
 async function poll() {
   try {
-    var j = await api('/api/state');
+    var stateUrl = '/api/state';
+    if (S.rev >= 0) stateUrl += '?since_rev=' + encodeURIComponent(S.rev);
+    var j = await api(stateUrl);
     var wasOnline = S.online;
     var hadData = S.data != null;
-    S.online = true; S.data = j;
+    S.online = true;
+    if (j.unchanged) {
+      if (!wasOnline) { toast(tr('backOnline')); flushQueue(); }
+      renderConn();
+      return;
+    }
+    S.data = j;
     S.skew = j.now - Date.now() / 1000;
     if (j.catalog_rev !== undefined && j.catalog_rev !== S.catalogRev) {
       S.catalogRev = j.catalog_rev;
