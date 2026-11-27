@@ -12,12 +12,20 @@
 /* ---------- base ---------- */
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 :root {
-  --bg: #f4f6fa; --panel: #ffffff; --panel2: #e9edf4; --line: #d7deea;
-  --tx: #17212e; --tx2: #5d6b80; --acc: #0d9488; --acc2: #0f766e;
-  --sent: #d97706; --prep: #7c3aed; --ready: #16a34a; --served: #64748b; --cancel: #dc2626;
+  color-scheme: light;
+  --bg: #f5f5f1; --panel: #ffffff; --panel2: #efefe9; --line: #e3e2da; --line2: #d1d0c6;
+  --tx: #21261f; --tx2: #6e7265; --acc: #2e6b53; --acc2: #26563f; --acc-tint: #e9efe9;
+  --sent: #9c6b1d; --sent-bg: #f4ecda; --sent-line: #e0d2ac; --sent-deep: #7a5414;
+  --prep: #575f96; --prep-bg: #eceef5; --prep-line: #d4d8e8; --prep-deep: #454e7e;
+  --ready: #3d7c51; --ready-bg: #e7f0e6; --ready-line: #cbdfce; --ready-deep: #2f6440;
+  --served: #6f746a; --served-bg: #eeefe9; --served-line: #dbdcd2; --served-deep: #5d6157;
+  --cancel: #a8483f; --cancel-bg: #f6e8e5; --cancel-line: #e5cbc5; --cancel-deep: #8f3e36;
+  --ink: #232823; --shadow-sm: 0 1px 2px rgba(28,32,24,.05); --shadow-md: 0 3px 10px rgba(28,32,24,.07); --shadow-lg: 0 18px 48px rgba(24,28,20,.18);
 }
+:root[data-theme="cool"] { --bg:#f4f6fa; --panel:#fff; --panel2:#e9edf4; --line:#d7deea; --line2:#c7d0df; --tx:#17212e; --tx2:#5d6b80; --acc:#0d9488; --acc2:#0f766e; --sent:#d97706; --sent-bg:#fff3dd; --sent-line:#edd8ae; --sent-deep:#8a5300; --prep:#7c3aed; --prep-bg:#eee7fb; --prep-line:#d9c9f3; --prep-deep:#5e2ca5; --ready:#16a34a; --ready-bg:#e5f5e9; --ready-line:#c5e5ce; --ready-deep:#167337; --served:#64748b; --served-bg:#edf0f4; --served-line:#d8dee7; --served-deep:#526174; --cancel:#dc2626; --cancel-bg:#fce8e8; --cancel-line:#f2caca; --cancel-deep:#a51d1d; --ink:#17212e; }
+:root[data-theme="neutral"] { --bg:#f2f2ef; --panel:#fff; --panel2:#ecece8; --line:#deded8; --line2:#c9c9c1; --tx:#292b27; --tx2:#6c6e67; --acc:#525b54; --acc2:#414a43; --sent:#92702e; --sent-bg:#f3eedf; --sent-line:#e2d7b9; --sent-deep:#72541e; --prep:#626a78; --prep-bg:#eceef1; --prep-line:#d5d9df; --prep-deep:#4e5664; --ready:#55775b; --ready-bg:#e8efe7; --ready-line:#cfddcd; --ready-deep:#3f6245; --served:#777a72; --served-bg:#eeeeea; --served-line:#ddddd5; --served-deep:#5d6059; --cancel:#a75048; --cancel-bg:#f5e9e6; --cancel-line:#e5cbc6; --cancel-deep:#85413a; --ink:#292b27; }
 html, body { margin: 0; padding: 0; background: var(--bg); color: var(--tx);
-  font: 15px/1.45 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font: 15px/1.5 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   min-height: 100%; }
 body { touch-action: manipulation; }
 [dir="rtl"] body { direction: rtl; }
@@ -148,7 +156,7 @@ label.f { display: block; margin: 12px 0 4px; color: var(--tx2); font-size: 13.5
   background: rgba(15, 23, 42, .72); color: #fff; font-size: 11px; font-weight: 700; }
 .admin-menu-info[onclick] { cursor: pointer; }
 .admin-menu-info { padding: 9px 10px 5px; }
-.admin-menu-name { min-height: 2.6em; font-weight: 750; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2;
+.admin-menu-name { min-height: 2.6em; font-weight: 750; line-height: 1.3; display: -webkit-box; line-clamp: 2; -webkit-line-clamp: 2;
   -webkit-box-orient: vertical; overflow: hidden; }
 .admin-menu-meta { display: flex; align-items: center; justify-content: space-between; gap: 5px; margin-top: 6px; color: var(--tx2); font-size: 11px; }
 .admin-menu-meta b { color: var(--acc); font-size: 14px; white-space: nowrap; }
@@ -485,6 +493,107 @@ label.f, .sales-filters label { color: #627269; }
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
 }
 
+
+.template-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin:8px 0 18px; }
+.template-card { display:grid; gap:8px; text-align:left; padding:10px; border:2px solid var(--line); border-radius:14px; background:var(--panel); }
+.template-card.selected { border-color:var(--acc); box-shadow:0 0 0 2px rgba(46,107,83,.18); }
+.template-preview { height:66px; display:flex; align-items:flex-end; gap:6px; padding:9px; border-radius:9px; background:var(--bg); border:1px solid var(--line); }
+.template-preview i { display:block; height:28px; flex:1; border-radius:5px; background:var(--panel2); border-bottom:4px solid var(--acc); }
+.template-preview i:nth-child(2) { border-color:var(--prep); } .template-preview i:nth-child(3) { border-color:var(--ready); }
+
+/* Distinct restaurant appearance templates */
+:root[data-theme="cool"] {
+  color-scheme: dark;
+  --bg:#101827; --panel:#1b2638; --panel2:#25344b; --line:#34445c; --line2:#455873;
+  --tx:#eef5ff; --tx2:#a9bbd2; --acc:#38bdf8; --acc2:#0284c7; --acc-tint:#123952;
+  --ink:#f4f8ff; --shadow-sm:0 2px 7px rgba(0,0,0,.22); --shadow-md:0 8px 22px rgba(0,0,0,.28); --shadow-lg:0 20px 55px rgba(0,0,0,.48);
+  --sent:#fbbf24; --sent-bg:#453619; --sent-line:#765d27; --sent-deep:#ffdb70;
+  --prep:#c084fc; --prep-bg:#35224c; --prep-line:#60417b; --prep-deep:#dfb9ff;
+  --ready:#4ade80; --ready-bg:#153a2a; --ready-line:#286347; --ready-deep:#8cf0b1;
+  --served:#9aabc0; --served-bg:#29374b; --served-line:#40516a; --served-deep:#c5d1e0;
+  --cancel:#fb7185; --cancel-bg:#481f2a; --cancel-line:#783542; --cancel-deep:#ffb0bd;
+}
+:root[data-theme="cool"] body { background-image:radial-gradient(ellipse at top left,#1c3552 0,transparent 42%); }
+:root[data-theme="cool"] .topbar { background:rgba(16,24,39,.94); border-bottom:1px solid var(--line); }
+:root[data-theme="cool"] .btn, :root[data-theme="cool"] .in, :root[data-theme="cool"] select, :root[data-theme="cool"] textarea { color:var(--tx); }
+:root[data-theme="cool"] .btn.primary { color:white; }
+:root[data-theme="cool"] .tcard, :root[data-theme="cool"] .admin-table-card,
+:root[data-theme="cool"] .card, :root[data-theme="cool"] .kcard { border:1px solid var(--line); box-shadow:var(--shadow-md); }
+:root[data-theme="neutral"] {
+  --bg:#f1e9dc; --panel:#fffaf1; --panel2:#e9ddcb; --line:#d4c3a9; --line2:#bba789;
+  --tx:#382819; --tx2:#80694e; --acc:#a94d2b; --acc2:#80371e; --acc-tint:#f4dfd0;
+  --sent:#a65d12; --sent-bg:#f5e4c9; --sent-line:#dfc193; --sent-deep:#75400c;
+  --prep:#8051a0; --prep-bg:#eee2f4; --prep-line:#d4bde1; --prep-deep:#60327e;
+  --ready:#477444; --ready-bg:#e4efdc; --ready-line:#bfd4b2; --ready-deep:#325b30;
+  --served:#786957; --served-bg:#e9dfd1; --served-line:#d1c2ae; --served-deep:#5c4e3d;
+  --cancel:#b43e32; --cancel-bg:#f5dfd8; --cancel-line:#e4bbb0; --cancel-deep:#872d25;
+  --ink:#382819; --shadow-sm:0 2px 4px rgba(76,48,20,.08); --shadow-md:0 8px 20px rgba(76,48,20,.12); --shadow-lg:0 20px 45px rgba(76,48,20,.22);
+}
+:root[data-theme="neutral"] body { font-family:Georgia,"Times New Roman",serif; background-image:linear-gradient(135deg,#f1e9dc,#e9ddcb); }
+:root[data-theme="neutral"] .topbar { background:#80371e; color:#fffaf1; }
+:root[data-theme="neutral"] .topbar .btn { color:#fffaf1; background:#a94d2b; border-color:#c77b54; }
+:root[data-theme="neutral"] .tcard, :root[data-theme="neutral"] .admin-table-card,
+:root[data-theme="neutral"] .card, :root[data-theme="neutral"] .kcard { border:2px solid #d4c3a9; border-radius:5px; box-shadow:var(--shadow-md); }
+:root[data-theme="neutral"] .btn { border-radius:5px; }
+/* Template contrast fixes */
+:root[data-theme="neutral"] .topbar,
+:root[data-theme="neutral"] .topbar .restaurant-brand,
+:root[data-theme="neutral"] .topbar .restaurant-brand-name,
+:root[data-theme="neutral"] .topbar .tb-title,
+:root[data-theme="neutral"] .topbar .tb-sub { color:#fffaf1 !important; }
+:root[data-theme="neutral"] .topbar .tb-sub { opacity:.9; }
+:root[data-theme="cool"] .topbar { background:#101827 !important; color:var(--tx); }
+:root[data-theme="cool"] .btn { background:#25344b !important; color:#eef5ff !important; border-color:#455873 !important; }
+:root[data-theme="cool"] .btn.primary { background:#0284c7 !important; border-color:#38bdf8 !important; color:#fff !important; }
+:root[data-theme="cool"] .tabs .btn.on { background:#123952 !important; color:#7dd3fc !important; border-color:#38bdf8 !important; }
+:root[data-theme="cool"] .tcard, :root[data-theme="cool"] .tcard.st-ready,
+:root[data-theme="cool"] .tcard.st-sent, :root[data-theme="cool"] .tcard.st-preparing,
+:root[data-theme="cool"] .admin-table-card, :root[data-theme="cool"] .panel,
+:root[data-theme="cool"] .ticket, :root[data-theme="cool"] .station-card,
+:root[data-theme="cool"] .catalog-pane, :root[data-theme="cool"] .kcard { background:#1b2638 !important; color:#eef5ff !important; border-color:#455873 !important; }
+:root[data-theme="cool"] .in, :root[data-theme="cool"] select, :root[data-theme="cool"] textarea { background:#172235 !important; color:#eef5ff !important; border-color:#455873 !important; }
+:root[data-theme="cool"] .topbar .restaurant-brand, :root[data-theme="cool"] .topbar .restaurant-brand-name { color:#eef5ff !important; }
+
+@media (max-width: 900px) {
+  .pad { padding:8px; }
+  .panel { padding:10px; }
+  .topbar { min-height:48px; padding:6px 9px; gap:6px; }
+  .tabs { gap:4px; padding:6px 8px 0; }
+  .tabs .btn { min-height:34px; padding:5px 8px; font-size:12px; }
+  .admin-table-card { padding:10px; gap:4px; }
+  .admin-tables-grid { gap:7px; }
+  .menu-breadcrumb { margin:4px 0; }
+  .menu-grid { gap:7px; }
+  .pos-target { margin-bottom:5px; gap:5px; }
+  .pos-target .btn { min-height:36px; padding:6px 9px; }
+  .searchrow { margin:5px 0; }
+  .admin-menu-grid { gap:7px; }
+}
+
+/* Consistent responsive navigation and header controls */
+.topbar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; }
+.tb-left { flex:1 1 auto; }
+.tb-right { flex:0 1 auto; justify-content:flex-end; flex-wrap:wrap; gap:6px; }
+.tb-right > .btn, .tb-right > .admin-back { flex:0 0 auto; }
+.tabs { display:flex; flex-wrap:nowrap; overflow-x:auto; overflow-y:hidden; scrollbar-width:thin; -webkit-overflow-scrolling:touch; }
+.tabs .btn { flex:0 0 auto; white-space:nowrap; }
+@media (max-width: 700px) {
+  .topbar { align-items:center; gap:5px; padding:6px 8px; }
+  .tb-left { flex:1 1 100%; min-height:30px; gap:6px; }
+  .tb-right { flex:1 1 100%; justify-content:flex-start; flex-wrap:nowrap; overflow-x:auto; padding-bottom:1px; }
+  .tb-title { font-size:16px; }
+  .tb-right .btn, .tb-left .btn { min-height:34px; padding:5px 8px; font-size:12px; }
+  .restaurant-brand { margin-left:0; }
+  .tabs { gap:4px; padding:5px 8px 0; }
+  .tabs .btn { min-height:34px; padding:5px 9px; font-size:12px; }
+}
+@media (min-width: 701px) and (max-width: 1024px) {
+  .topbar { padding:8px 12px; gap:6px 10px; }
+  .tb-right { gap:5px; }
+  .tb-right .btn { min-height:38px; padding:6px 9px; font-size:13px; }
+  .tabs { padding:8px 12px 0; gap:5px; }
+  .tabs .btn { min-height:36px; padding:6px 9px; font-size:12.5px; }
+}
 </style>
 </head>
 <body>
@@ -1085,6 +1194,7 @@ async function poll() {
   try {
     var j = await api('/api/state');
     var wasOnline = S.online;
+    var hadData = S.data != null;
     S.online = true; S.data = j;
     S.skew = j.now - Date.now() / 1000;
     if (j.catalog_rev !== undefined && j.catalog_rev !== S.catalogRev) {
@@ -1095,7 +1205,7 @@ async function poll() {
     if (S.role === 'kitchen') detectNewOrders(j);
     var changed = j.rev !== S.rev;
     S.rev = j.rev;
-    if (changed && S.role) render();
+    if ((changed && S.role) || !hadData) render();
     if (!wasOnline) { toast(tr('backOnline')); flushQueue(); }
     renderConn();
   } catch (e) {
@@ -1177,6 +1287,7 @@ function connDot() { return '<span class="dot ' + (S.online ? '' : 'off') + '" t
 
 // ---------- render dispatcher ----------
 function render() {
+  document.documentElement.dataset.theme = (S.data && S.data.settings && S.data.settings.theme) || 'warm';
   // preserve focus/selection of an input across re-render (search boxes)
   var ae = document.activeElement, aeId = ae ? ae.id : null, pos = null;
   if (ae && ae.id && ae.selectionStart != null) pos = ae.selectionStart;
@@ -1602,11 +1713,11 @@ function renderTableScreen(app, me, isAdminPos) {
 
   var targetPicker = isAdminPos ? '<div class="pos-target"><button class="btn ' + (S.adminOrderType === 'dine_in' ? 'on' : '') + '" onclick="setAdminOrderType(\'dine_in\')">🪑 Dine-in</button><button class="btn ' + (S.adminOrderType === 'imported' ? 'on' : '') + '" onclick="setAdminOrderType(\'imported\')">📦 Imported Order</button>' +
     (S.adminOrderType === 'dine_in' ? '<label>Table <input class="in pos-table" type="number" min="1" value="' + esc(S.adminDineInTable) + '" onchange="setAdminDineInTable(this.value)"></label>' : '') + '</div>' : '';
-  var page = (isAdminPos ? '<div class="topbar"><div class="tb-left"><span class="tb-title">' + (S.adminOrderType === 'imported' ? '📦 Imported Order' : '🪑 Table ' + tableNo) + '</span></div></div>' : waiterHeader(me, true)) +
+  var page = (isAdminPos ? '' : waiterHeader(me, true)) +
     '<div class="twocol' + (isAdminPos ? ' admin-pos' : '') + '">' +
       (isAdminPos ? '' : '<div class="panel"><h3>' + tr('tickets') + '</h3>' + tickets + history + '</div>') +
       '<div><div class="panel">' +
-        '<h3>' + tr('menu') + '</h3>' +
+        (isAdminPos ? '' : '<h3>' + tr('menu') + '</h3>') +
         targetPicker +
         '<div class="searchrow"><input id="f-wsearch" class="in" placeholder="' + tr('searchMenu') + '" ' +
           'value="' + esc(S.search) + '" oninput="setSearch(this.value)"></div>' +
@@ -2815,10 +2926,7 @@ function adminKitchen() {
     (unassignedStaff.length ? '<button class="btn small ' + (activeFilter === '__unassigned__' ? 'on' : '') + '" onclick="setKitchenFilter(\'__unassigned__\')">⚠ ' + tr('unassigned') + ' (' + unassignedStaff.length + ')</button>' : '') +
   '</div>';
 
-  return '<div class="fabrow" style="gap:8px;flex-wrap:wrap;justify-content:space-between;align-items:center;">' +
-      '<h2 style="margin:0;font-size:20px;">👨‍🍳 ' + tr('kitchenConfig') + '</h2>' +
-    '</div>' +
-    '<div class="station-grid">' + stationCardsHtml + '</div>' +
+  return '<div class="station-grid">' + stationCardsHtml + '</div>' +
 
     '<div class="kitchen-section-title">' +
       '<span>👨‍🍳 ' + tr('kitchenStaff') + ' (' + filteredStaff.length + ')</span>' +
@@ -3398,7 +3506,7 @@ function adminTables() {
       '<b>' + tr('table') + ' ' + tableNo + '</b><span>' + active.length + ' ' + tr('ordersCount') + '</span>' +
       '<strong>' + tr('balanceDue') + ': ' + money(due) + '</strong></button>';
   }).join('');
-  return '<h2>' + tr('tableList') + '</h2><div class="admin-tables-grid">' +
+  return '<div class="admin-tables-grid">'+
     (cards || '<div class="empty">' + tr('noTables') + '</div>') + '</div>';
 }
 function adminTableHistoryBody() {
@@ -3500,6 +3608,10 @@ function adminSettings() {
   return '<div style="max-width:760px">' +
     '<h3>' + tr('restaurant') + '</h3>' +
     '<label class="f">' + tr('printedName') + '</label><input id="f-s-name" class="in" value="' + esc(st.restaurant_name || '') + '">' +
+    '<label class="f">Choose appearance template</label><div class="template-grid">' +
+      [['warm','Garden','Warm green'],['cool','Coastal','Cool blue'],['neutral','Stone','Neutral']].map(function (t) {
+        return '<button type="button" class="template-card' + ((st.theme || 'warm') === t[0] ? ' selected' : '') + '" aria-pressed="' + ((st.theme || 'warm') === t[0]) + '" onclick="selectTemplate(' + "'" + t[0] + "'" + ',this)"><span class="template-preview"><i></i><i></i><i></i></span><b>' + t[1] + '</b><span class="dim">' + t[2] + '</span></button>';
+      }).join('') + '</div><select id="f-s-theme" class="in hidden"><option value="warm">Garden</option><option value="cool">Coastal</option><option value="neutral">Stone</option></select>' +
     '<label class="f">Restaurant logo</label>' +
     '<p class="dim">Optional. Add a name, a logo, or both. The large logo is used on Home; the compact logo is used on app screens and tickets.</p>' +
     (st.restaurant_logo ? '<div class="settings-logo-preview"><img src="' + esc(st.restaurant_logo) + '" alt="Home logo"><button class="btn small danger" onclick="removeRestaurantLogo(\'home\')">Remove home logo</button></div>' : '') +
@@ -3522,6 +3634,19 @@ function adminSettings() {
     '<button class="btn" style="flex:0 0 auto" onclick="changePin()">' + tr('changePin') + '</button></div>' +
     '</div>';
 }
+async function selectTemplate(theme, button) {
+  var select = document.getElementById('f-s-theme');
+  if (select) select.value = theme;
+  document.documentElement.dataset.theme = theme;
+  document.querySelectorAll('.template-card').forEach(function (card) { var chosen = card === button; card.classList.toggle('selected', chosen); card.setAttribute('aria-pressed', String(chosen)); });
+  try {
+    await api('/api/settings', 'PUT', { theme: theme });
+    if (S.data && S.data.settings) S.data.settings.theme = theme;
+    toast('Template saved');
+  } catch (e) {
+    toast(e.code ? e.message : tr('needConnection'));
+  }
+}
 async function saveSettings() {
   var defaultIp = val('f-s-ip'), defaultPort = parseInt(val('f-s-port') || '9100', 10) || 9100;
   var adminIp = val('f-s-admin-ip');
@@ -3534,6 +3659,7 @@ async function saveSettings() {
   });
   var body = {
     restaurant_name: val('f-s-name'),
+    theme: val('f-s-theme'),
     currency: val('f-s-cur') || 'MAD',
     printer_ip: defaultIp,
     printer_port: defaultPort,
@@ -3605,6 +3731,7 @@ function boot() {
   window.addEventListener('offline', function () { S.online = false; renderConn(); });
   setInterval(function () { if (S.role === 'kitchen' && S.data) render(); }, 20000); // refresh ticket timers
   if (S.role) startPoll();
+  else poll();
   render();
 }
 document.addEventListener('DOMContentLoaded', boot);

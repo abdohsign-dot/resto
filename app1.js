@@ -590,6 +590,7 @@ async function poll() {
   try {
     var j = await api('/api/state');
     var wasOnline = S.online;
+    var hadData = S.data != null;
     S.online = true; S.data = j;
     S.skew = j.now - Date.now() / 1000;
     if (j.catalog_rev !== undefined && j.catalog_rev !== S.catalogRev) {
@@ -600,7 +601,7 @@ async function poll() {
     if (S.role === 'kitchen') detectNewOrders(j);
     var changed = j.rev !== S.rev;
     S.rev = j.rev;
-    if (changed && S.role) render();
+    if ((changed && S.role) || !hadData) render();
     if (!wasOnline) { toast(tr('backOnline')); flushQueue(); }
     renderConn();
   } catch (e) {
@@ -682,6 +683,7 @@ function connDot() { return '<span class="dot ' + (S.online ? '' : 'off') + '" t
 
 // ---------- render dispatcher ----------
 function render() {
+  document.documentElement.dataset.theme = (S.data && S.data.settings && S.data.settings.theme) || 'warm';
   // preserve focus/selection of an input across re-render (search boxes)
   var ae = document.activeElement, aeId = ae ? ae.id : null, pos = null;
   if (ae && ae.id && ae.selectionStart != null) pos = ae.selectionStart;

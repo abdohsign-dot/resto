@@ -1074,7 +1074,7 @@ def h_state(args, body, conn):
         "currency": CONFIG["currency"],
         "has_printer": any_printer_configured(),
         "settings": {k: CONFIG.get(k) for k in
-                     ("restaurant_name", "restaurant_logo", "restaurant_logo_compact", "currency", "printer_ip", "printer_port", "printers", "autoprint",
+                     ("restaurant_name", "restaurant_logo", "restaurant_logo_compact", "theme", "currency", "printer_ip", "printer_port", "printers", "autoprint",
                       "disk_warning_mb", "log_retention_days",
                       "ticket_amber_minutes", "ticket_red_minutes")},
         "branches": [dict(r) for r in conn.execute(
@@ -3277,11 +3277,15 @@ def h_settings(args, body, conn):
         CONFIG["restaurant_logo"] = save_uploaded_catalog_image(body["restaurant_logo_upload"])
     if "restaurant_logo_compact_upload" in body:
         CONFIG["restaurant_logo_compact"] = save_uploaded_catalog_image(body["restaurant_logo_compact_upload"])
-    allowed = ("restaurant_name", "restaurant_logo", "restaurant_logo_compact", "currency", "printer_ip", "printer_port", "printers", "autoprint", "admin_pin", "port",
+    allowed = ("restaurant_name", "restaurant_logo", "restaurant_logo_compact", "theme", "currency", "printer_ip", "printer_port", "printers", "autoprint", "admin_pin", "port",
                "disk_warning_mb", "log_retention_days", "ticket_amber_minutes", "ticket_red_minutes")
     for k in allowed:
         if k in body:
             v = body[k]
+            if k == "theme":
+                v = str(v or "warm")
+                if v not in ("warm", "cool", "neutral"):
+                    raise ApiError(400, "Invalid appearance template")
             if k in ("printer_port", "port") and v not in ("", None):
                 v = int(v)
             if k == "autoprint":

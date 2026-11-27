@@ -847,10 +847,7 @@ function adminKitchen() {
     (unassignedStaff.length ? '<button class="btn small ' + (activeFilter === '__unassigned__' ? 'on' : '') + '" onclick="setKitchenFilter(\'__unassigned__\')">⚠ ' + tr('unassigned') + ' (' + unassignedStaff.length + ')</button>' : '') +
   '</div>';
 
-  return '<div class="fabrow" style="gap:8px;flex-wrap:wrap;justify-content:space-between;align-items:center;">' +
-      '<h2 style="margin:0;font-size:20px;">👨‍🍳 ' + tr('kitchenConfig') + '</h2>' +
-    '</div>' +
-    '<div class="station-grid">' + stationCardsHtml + '</div>' +
+  return '<div class="station-grid">' + stationCardsHtml + '</div>' +
 
     '<div class="kitchen-section-title">' +
       '<span>👨‍🍳 ' + tr('kitchenStaff') + ' (' + filteredStaff.length + ')</span>' +
@@ -1430,7 +1427,7 @@ function adminTables() {
       '<b>' + tr('table') + ' ' + tableNo + '</b><span>' + active.length + ' ' + tr('ordersCount') + '</span>' +
       '<strong>' + tr('balanceDue') + ': ' + money(due) + '</strong></button>';
   }).join('');
-  return '<h2>' + tr('tableList') + '</h2><div class="admin-tables-grid">' +
+  return '<div class="admin-tables-grid">'+
     (cards || '<div class="empty">' + tr('noTables') + '</div>') + '</div>';
 }
 function adminTableHistoryBody() {
@@ -1532,6 +1529,10 @@ function adminSettings() {
   return '<div style="max-width:760px">' +
     '<h3>' + tr('restaurant') + '</h3>' +
     '<label class="f">' + tr('printedName') + '</label><input id="f-s-name" class="in" value="' + esc(st.restaurant_name || '') + '">' +
+    '<label class="f">Choose appearance template</label><div class="template-grid">' +
+      [['warm','Garden','Warm green'],['cool','Coastal','Cool blue'],['neutral','Stone','Neutral']].map(function (t) {
+        return '<button type="button" class="template-card' + ((st.theme || 'warm') === t[0] ? ' selected' : '') + '" aria-pressed="' + ((st.theme || 'warm') === t[0]) + '" onclick="selectTemplate(' + "'" + t[0] + "'" + ',this)"><span class="template-preview"><i></i><i></i><i></i></span><b>' + t[1] + '</b><span class="dim">' + t[2] + '</span></button>';
+      }).join('') + '</div><select id="f-s-theme" class="in hidden"><option value="warm">Garden</option><option value="cool">Coastal</option><option value="neutral">Stone</option></select>' +
     '<label class="f">Restaurant logo</label>' +
     '<p class="dim">Optional. Add a name, a logo, or both. The large logo is used on Home; the compact logo is used on app screens and tickets.</p>' +
     (st.restaurant_logo ? '<div class="settings-logo-preview"><img src="' + esc(st.restaurant_logo) + '" alt="Home logo"><button class="btn small danger" onclick="removeRestaurantLogo(\'home\')">Remove home logo</button></div>' : '') +
@@ -1554,6 +1555,19 @@ function adminSettings() {
     '<button class="btn" style="flex:0 0 auto" onclick="changePin()">' + tr('changePin') + '</button></div>' +
     '</div>';
 }
+async function selectTemplate(theme, button) {
+  var select = document.getElementById('f-s-theme');
+  if (select) select.value = theme;
+  document.documentElement.dataset.theme = theme;
+  document.querySelectorAll('.template-card').forEach(function (card) { var chosen = card === button; card.classList.toggle('selected', chosen); card.setAttribute('aria-pressed', String(chosen)); });
+  try {
+    await api('/api/settings', 'PUT', { theme: theme });
+    if (S.data && S.data.settings) S.data.settings.theme = theme;
+    toast('Template saved');
+  } catch (e) {
+    toast(e.code ? e.message : tr('needConnection'));
+  }
+}
 async function saveSettings() {
   var defaultIp = val('f-s-ip'), defaultPort = parseInt(val('f-s-port') || '9100', 10) || 9100;
   var adminIp = val('f-s-admin-ip');
@@ -1566,6 +1580,7 @@ async function saveSettings() {
   });
   var body = {
     restaurant_name: val('f-s-name'),
+    theme: val('f-s-theme'),
     currency: val('f-s-cur') || 'MAD',
     printer_ip: defaultIp,
     printer_port: defaultPort,
@@ -1637,6 +1652,7 @@ function boot() {
   window.addEventListener('offline', function () { S.online = false; renderConn(); });
   setInterval(function () { if (S.role === 'kitchen' && S.data) render(); }, 20000); // refresh ticket timers
   if (S.role) startPoll();
+  else poll();
   render();
 }
 document.addEventListener('DOMContentLoaded', boot);

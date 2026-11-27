@@ -181,11 +181,11 @@ function renderTableScreen(app, me, isAdminPos) {
 
   var targetPicker = isAdminPos ? '<div class="pos-target"><button class="btn ' + (S.adminOrderType === 'dine_in' ? 'on' : '') + '" onclick="setAdminOrderType(\'dine_in\')">🪑 Dine-in</button><button class="btn ' + (S.adminOrderType === 'imported' ? 'on' : '') + '" onclick="setAdminOrderType(\'imported\')">📦 Imported Order</button>' +
     (S.adminOrderType === 'dine_in' ? '<label>Table <input class="in pos-table" type="number" min="1" value="' + esc(S.adminDineInTable) + '" onchange="setAdminDineInTable(this.value)"></label>' : '') + '</div>' : '';
-  var page = (isAdminPos ? '<div class="topbar"><div class="tb-left"><span class="tb-title">' + (S.adminOrderType === 'imported' ? '📦 Imported Order' : '🪑 Table ' + tableNo) + '</span></div></div>' : waiterHeader(me, true)) +
+  var page = (isAdminPos ? '' : waiterHeader(me, true)) +
     '<div class="twocol' + (isAdminPos ? ' admin-pos' : '') + '">' +
       (isAdminPos ? '' : '<div class="panel"><h3>' + tr('tickets') + '</h3>' + tickets + history + '</div>') +
       '<div><div class="panel">' +
-        '<h3>' + tr('menu') + '</h3>' +
+        (isAdminPos ? '' : '<h3>' + tr('menu') + '</h3>') +
         targetPicker +
         '<div class="searchrow"><input id="f-wsearch" class="in" placeholder="' + tr('searchMenu') + '" ' +
           'value="' + esc(S.search) + '" oninput="setSearch(this.value)"></div>' +
